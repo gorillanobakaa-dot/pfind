@@ -1,0 +1,196 @@
+{
+  "title": "pfind v3.0.0: gap analysis, STATUS_REPORT ground truth, and --glob bug confirmation",
+  "concept": {
+    "problem_being_solved": "Five contradictory status documents existed in the pfind directory, produced by prior agents across this session. They gave completion estimates ranging from 70% to 100%, making it impossible to know the real state of the eza-0.23.5 + ripgrep-15.2.0 merge into pfind.py. The user needed a single reliable answer to: 'have all capabilities been merged?'",
+    "approach_taken": "Ground-truth extraction from primary sources. Rather than reading the prior status documents, all three sources were interrogated directly: (1) python3 pfind.py --help for the live argparse output, (2) grep of all .rs files in eza-0.23.5/src/ for the canonical eza flag list, (3) grep of all .rs files in ripgrep-15.2.0/ plus rg --help for the ripgrep flag list. Set difference produced the real gap. All five prior documents were superseded by a single STATUS_REPORT.md written from verified evidence.",
+    "before_state": "Five status documents in /home/gorilla/Documents/Scripts.For.Work/pfind/ gave contradictory completion estimates: STATUS_REPORT.md (old, 70%), IMPLEMENTATION_PROGRESS.md (100%, all tested PASS), CORRECTED_STATUS_REPORT.md (85-90%, untested), REVISED_GAP_ANALYSIS.md (85-90%), PFIND_GAP_ANALYSIS.md (70%). The --glob flag was documented as broken in GLOB_BUG_FINDINGS.md but IMPLEMENTATION_PROGRESS.md still claimed 100% complete. No single document was trustworthy.",
+    "after_state": "One authoritative STATUS_REPORT.md (343 lines) supersedes all five prior documents. Actual completion is ~80% of the combined eza+ripgrep flag surface from PFIND_SUPER_MERGE_ACTION_PLAN.md: ~82 flags implemented, ~9 partial, ~37 absent. The --glob bug was confirmed fixed in the current pfind.py (args.globs consumers verified at lines 1700, 1715, 1737, 1740, 1849, 1869). pfind.py remains at 1969 lines as uncommitted working-tree changes against git HEAD c6dbb02.",
+    "known_alternatives": "Not available in the source material. No commit messages document why prior agents chose to produce multiple status documents rather than a single authoritative one. The narrative notes that the prior documents failed because agents read --help output rather than the Rust source trees \u2014 but the reason prior agents chose that approach is not documented."
+  },
+  "reference": {
+    "files_changed": [
+      {
+        "file": "STATUS_REPORT.md",
+        "change": "added",
+        "what_changed": "New 343-line ground-truth status document, superseding all five prior status documents",
+        "why": "Five contradictory prior documents made the true completion state unknowable. A single source-verified document was needed."
+      },
+      {
+        "file": "pfind.py",
+        "change": "modified (by prior agents, not this session)",
+        "what_changed": "1884 insertions / 508 deletions vs git HEAD c6dbb02 (pfind v2.1.0). The v3.0.0 super-merge of ripgrep-15.2.0 + eza-0.23.5 capabilities. Includes: all four layout modes (tree/long/grid/oneline), GitStatusCache, LocCounts, apply_replacement_preview(), context windowing, 50+ language types, --glob bug fix, and RRF extended to 5 signals.",
+        "why": "Not changed in this session. Examined only."
+      },
+      {
+        "file": "README.md",
+        "change": "deleted (working tree)",
+        "what_changed": "508 lines removed from working tree. Not deleted from git \u2014 git status shows 'deleted' meaning the working-tree file is gone but it is staged as a deletion, not committed.",
+        "why": "Not investigated in this session. Prior agent action."
+      }
+    ],
+    "decisions_made": [
+      {
+        "decision": "Completeness figure set at ~80%, not 85-90%",
+        "reason": "85-90% (prior agents' best estimate) was rejected because it did not count 6 missing environment variables or partial implementations (--time-style missing long-iso/full-iso, --loc missing =lines|percent|both, archive search missing zip/tar/zst). The 80% figure was derived from counting ~82 implemented, ~9 partial, ~37 absent out of ~128 action-plan items.",
+        "basis": "model_inference"
+      },
+      {
+        "decision": "All five prior status documents explicitly superseded, not merged",
+        "reason": "Contradictory documents are worse than no documents. A reader who sees both '70% complete' and '100% complete' cannot act. The new STATUS_REPORT.md names each superseded document and explains why it was wrong.",
+        "basis": "stated_in_input"
+      },
+      {
+        "decision": "No missing flags implemented during this session",
+        "reason": "The user asked whether flags had been merged, not to merge them. Implementing ~37 missing flags was not requested and was not done.",
+        "basis": "stated_in_input"
+      },
+      {
+        "decision": "pfind.py not committed to git",
+        "reason": "Not requested. The v3.0.0 work remains as uncommitted working-tree changes, same state as before this session.",
+        "basis": "stated_in_input"
+      }
+    ],
+    "tried_and_abandoned": [
+      {
+        "attempt": "Reading prior status documents to determine completion state",
+        "why_abandoned": "The five prior documents contradicted each other directly (70% vs 100%). Reading them could not produce a reliable answer. Primary source extraction was used instead."
+      }
+    ],
+    "claimed_but_not_verified": [
+      "CHANGELOG line 29 claims zip and tar archive search is implemented. py_fallback_content() was inspected and only gz/bz2/xz/lzma were found. zip/tar/zst absent from Python fallback.",
+      "IMPLEMENTATION_PROGRESS.md claims all 43 listed features were tested and passed. No test run was performed in this session. The glob bug fix (present in current pfind.py) contradicts the '100% complete' claim directly.",
+      "--replace regex replacement (apply_replacement_preview() exists and is called) was not run against a live regex to confirm capture-group substitution correctness.",
+      "RRF fusion 5-signal formula (name/semantic/content/git/recency) exists in code. Correctness of ranking output was not validated.",
+      "--brain semantic seam not tested (requires running Chroma DB)."
+    ],
+    "open_items": [
+      {
+        "item": "pfind.py is uncommitted at v3.0.0. git HEAD is still c6dbb02 (v2.1.0).",
+        "priority": "high",
+        "blocking": "Any agent starting a new session will see git HEAD as v2.1.0 and may re-implement features that already exist in the working tree."
+      },
+      {
+        "item": "README.md deleted from working tree but not committed as deletion.",
+        "priority": "high",
+        "blocking": "Users cloning the repo see v2.1.0 README. No documentation of v3.0.0 capabilities exists in git."
+      },
+      {
+        "item": "~37 flags from PFIND_SUPER_MERGE_ACTION_PLAN.md not implemented. Highest-impact: --no-ignore-exclude, --no-ignore-messages, --encoding, --trim, --git-repos, --git-repos-no-status, --git-ignore, --time-style long-iso/full-iso/+FORMAT, --no-permissions, --no-filesize, --no-user, --no-time.",
+        "priority": "medium",
+        "blocking": "nothing currently \u2014 tool is usable without them"
+      },
+      {
+        "item": "6 environment variables (TIME_STYLE, EZA_MIN_LUMINANCE, EZA_GRID_ROWS, EZA_OVERRIDE_GIT, COLUMNS, RIPGREP_CONFIG_PATH) not read. Zero os.environ calls in pfind.py.",
+        "priority": "medium",
+        "blocking": "nothing currently"
+      },
+      {
+        "item": "Archive search (-z) Python fallback missing zip/tar/zst support despite CHANGELOG claim.",
+        "priority": "low",
+        "blocking": "nothing currently \u2014 rg binary handles these when present"
+      }
+    ]
+  },
+  "verification_task": {
+    "task_title": "Verify the STATUS_REPORT.md claims against pfind.py directly",
+    "steps": [
+      {
+        "step": 1,
+        "action": "python3 pfind.py --help 2>&1 | grep -c '\\-\\-'",
+        "expected_result": "Count \u2265 90. Confirms argparse exposes the flags STATUS_REPORT.md claims are implemented.",
+        "what_failure_looks_like": "Count below 80 would indicate argparse entries were removed or the script has a parse error."
+      },
+      {
+        "step": 2,
+        "action": "grep -n 'args\\.globs' pfind.py | wc -l",
+        "expected_result": "Count \u2265 8. Confirms the --glob bug fix is present (args.globs consumed at multiple call sites).",
+        "what_failure_looks_like": "Count of 0 or 1 means args.globs is still a silent no-op and the glob bug was not fixed."
+      },
+      {
+        "step": 3,
+        "action": "grep -c 'def apply_replacement_preview\\|def render_tree_view\\|def render_long_table\\|def render_grid\\|def render_oneline\\|class GitStatusCache\\|class LocCounts' pfind.py",
+        "expected_result": "7. All seven core functions/classes claimed as implemented in STATUS_REPORT.md Section 1 are present.",
+        "what_failure_looks_like": "Any count below 7 means at least one claimed implementation is absent."
+      },
+      {
+        "step": 4,
+        "action": "grep -c 'os\\.environ\\|os\\.getenv\\|environ\\.get' pfind.py",
+        "expected_result": "0. Confirms STATUS_REPORT.md Section 2.3 claim that no environment variables are read.",
+        "what_failure_looks_like": "Any count above 0 means at least one env var IS read, and Section 2.3 is incorrect."
+      },
+      {
+        "step": 5,
+        "action": "python3 pfind.py 'def rrf_fuse' /home/gorilla/Documents/Scripts.For.Work/pfind --limit 3 2>&1 | head -5",
+        "expected_result": "Output shows pfind.py as a result with line number. Confirms basic search is functional.",
+        "what_failure_looks_like": "Python traceback or 'no results' means the tool is broken at the most basic level."
+      }
+    ]
+  },
+  "technical_debt": [
+    {
+      "item": "v3.0.0 uncommitted for an indeterminate period. Seven hours of merge work exist only in the working tree.",
+      "severity": "high",
+      "recommendation": "git add pfind.py STATUS_REPORT.md && git commit -m 'pfind v3.0.0: super-merge ripgrep-15.2.0 + eza-0.23.5'"
+    },
+    {
+      "item": "CHANGELOG in pfind.py header (lines 29-35) claims zip/tar archive support and --level flag \u2014 both absent from actual implementation. CHANGELOG is aspirational, not factual.",
+      "severity": "medium",
+      "recommendation": "Update CHANGELOG to accurately reflect what is implemented. Move aspirational claims to a ROADMAP section."
+    },
+    {
+      "item": "--time-style only accepts relative|iso|default. eza spec and action plan require long-iso, full-iso, and +FORMAT. format_timestamp() function exists and would need only 3 extra branches.",
+      "severity": "low",
+      "recommendation": "Add long-iso, full-iso, and +FORMAT (strftime passthrough) to format_timestamp() and update argparse choices."
+    },
+    {
+      "item": "Five superseded status documents (STATUS_REPORT.md old, CORRECTED_STATUS_REPORT.md, REVISED_GAP_ANALYSIS.md, PFIND_GAP_ANALYSIS.md, IMPLEMENTATION_PROGRESS.md) still exist in the directory and will confuse future agents.",
+      "severity": "medium",
+      "recommendation": "Archive to a superseded/ subdirectory or delete. The new STATUS_REPORT.md explicitly names them as superseded."
+    }
+  ],
+  "claim_sources": [
+    {
+      "claim": "Actual completion is ~80%, not 70% or 100%",
+      "basis": "model_inference",
+      "evidence": "~82 implemented + ~9 partial + ~37 absent of ~128 action-plan items, derived by set-difference between pfind argparse output and Rust source flag lists"
+    },
+    {
+      "claim": "--glob bug was fixed in current pfind.py",
+      "basis": "stated_in_input",
+      "evidence": "args.globs consumers confirmed at lines 1700, 1715, 1737, 1740, 1849, 1869 via grep"
+    },
+    {
+      "claim": "zip/tar/zst archive support absent from Python fallback despite CHANGELOG claim",
+      "basis": "stated_in_input",
+      "evidence": "py_fallback_content() inspection found only gzip.open, bz2.open, lzma.open \u2014 no zipfile or tarfile calls"
+    },
+    {
+      "claim": "All 6 environment variables are absent",
+      "basis": "stated_in_input",
+      "evidence": "grep for os.environ/os.getenv returned no results in pfind.py"
+    },
+    {
+      "claim": "git HEAD is still v2.1.0, v3.0.0 is uncommitted",
+      "basis": "stated_in_input",
+      "evidence": "git log shows HEAD at c6dbb02 'pfind v2.1.0'; git diff --stat shows +1884/-508 as unstaged changes"
+    }
+  ],
+  "glossary": [
+    {
+      "term": "working tree",
+      "definition": "Files on disk before being saved to git. Lost on file deletion; not version-controlled until committed."
+    },
+    {
+      "term": "RRF fusion",
+      "definition": "Reciprocal Rank Fusion. Combines ranked lists from name, semantic, and content search signals into one ranked output using formula: sum(weight/(k+rank))."
+    },
+    {
+      "term": "py_fallback_content()",
+      "definition": "Pure-Python search path used when the rg binary is absent. Slower than ripgrep but produces equivalent output for supported features."
+    },
+    {
+      "term": "args.globs consumer",
+      "definition": "A call site in pfind.py that passes args.globs to rg_common_globs() or _apply_user_globs(). The absence of consumers was the --glob silent bug."
+    }
+  ]
+}
