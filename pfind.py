@@ -21,8 +21,32 @@
 # every improvement can flow back and the tool keeps growing. Improvements welcome
 # upstream: https://github.com/gorillanobakaa-dot/pfind
 #
-# VERSION: 3.0.0 | UPDATED: 2026-08-15 | STATUS: live
+# VERSION: 3.2.0 | UPDATED: 2026-08-17 | STATUS: live
 # CHANGELOG:
+#   3.2.0 (2026-08-17) — Portability: nothing machine-specific is hardcoded any more. Hostname from
+#       socket.gethostname(), workers from os.cpu_count(), --brain/--work/--src preset roots and the
+#       Chroma store from ~/.config/pfind/presets.json or PFIND_* env vars. An unconfigured preset
+#       refuses with setup instructions instead of guessing. --max now also caps match blocks in
+#       context mode (one kernel file with 36 hits printed all 36; 35 KB -> 16.5 KB) and prints
+#       '… N more match(es)' when it bites. This version ships embedded inside gorilla-opencode as
+#       the engine of its `find` tool.
+#   3.1.0 (2026-08-17) — Dead-flag repair + flag-surface completion against eza 0.23.5 / ripgrep 15.2.0.
+#       (1) DEAD FLAG REPAIR: fourteen flags were parsed by argparse and never read by any code path
+#           (the same class of bug as the 3.0.0 --glob no-op). Now wired end-to-end, rg side and
+#           pure-Python side: -o/--only-matching, -m/--max-count, -a/--text, --binary, --max-filesize,
+#           --one-file-system, --no-ignore-dot, --no-ignore-global, --no-ignore-parent, --no-ignore-vcs,
+#           --color-scale-mode, --time, --show-symlinks, --follow-symlinks.
+#       (2) EZA COMPLETION: --across, --width, --numeric, --group, --smart-group, --classify, --absolute,
+#           --extended, --flags, --mounts, --short-nix, --stdin, --dereference, --treat-dirs-as-files,
+#           --no-permissions, --no-filesize, --no-time, --no-user, --no-quotes, --git-repos,
+#           --git-repos-no-status, --git-ignore, --changed; --time-style gains long-iso/full-iso/+FORMAT;
+#           --sort gains eza's full vocabulary; --loc/--code gain =lines|percent|both.
+#       (3) RIPGREP COMPLETION: --iglob, --glob-case-insensitive, --ignore-file, --no-ignore-exclude,
+#           --no-ignore-messages, --no-require-git, --encoding, --engine, --multiline, --line-regexp,
+#           --max-columns, --max-columns-preview, --byte-offset, --with-filename, --no-filename, --trim,
+#           --passthru, --stop-on-nonmatch, --colors, --hostname-bin, --crlf, --null-data, --no-unicode,
+#           --mmap/--no-mmap, --block-buffered, --line-buffered, --dfa-size-limit, --regex-size-limit,
+#           --no-config.
 #   3.0.0 (2026-08-15) — The Super-Merge: unified ripgrep-15.2.0 + eza-0.23.5 capabilities into pfind.
 #       (1) RIPGREP INGESTION: Context lines (-C, -A, -B) with line-range deduplication & '--' markers;
 #           archive/compressed search (-z/--search-zip for .gz, .bz2, .xz, .lzma, .zst, .tar, .zip);
@@ -62,7 +86,9 @@ import os
 import pwd
 import grp
 import re
+import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -72,22 +98,57 @@ import zipfile
 from collections import defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import quote
 
 # ---------------------------------------------------------------------------
-# Machine & Architecture Constants
+# Machine & Preset Resolution — NOTHING machine-specific is hardcoded.
+#
+# pfind ships inside gorilla-opencode and must behave identically on any
+# computer it lands on. The hostname comes from the system, the worker count
+# from the CPU, and the --brain/--work/--src preset roots from the user's own
+# config file (or environment), never from a path baked in here. A preset that
+# is not configured refuses with instructions rather than guessing — silence
+# and success must never look alike.
 # ---------------------------------------------------------------------------
-MACHINE = "gorilla-sve14a3aj"
-LOGICAL_CPUS = 8
+MACHINE = os.environ.get("PFIND_MACHINE") or socket.gethostname() or "localhost"
+LOGICAL_CPUS = os.cpu_count() or 4
 
 HOME = Path.home()
-PRESET_ROOTS = {
-    "brain": HOME / "Documents" / "SECOND.BRAIN",
-    "work":  HOME / "Documents" / "FIREFOX.WORK",
-    "src":   HOME / "firefox-main",
-}
-BRAIN_CHROMA = HOME / "Documents" / "SECOND.BRAIN" / "Chroma.DB.and.Brain.xml" / "chroma_db"
-BRAIN_DEFAULT_COLLECTION = "core_memory"
+PRESETS_CONFIG = (
+    Path(os.environ.get("XDG_CONFIG_HOME") or (HOME / ".config")) / "pfind" / "presets.json"
+)
+
+def _load_preset_config():
+    """Read the preset map. Environment variables override the config file;
+    both are optional. Returns (roots, chroma_path, collection)."""
+    roots, chroma, collection = {}, None, "core_memory"
+    try:
+        with open(PRESETS_CONFIG, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for name in ("brain", "work", "src"):
+            if data.get(name):
+                roots[name] = Path(str(data[name])).expanduser()
+        if data.get("chroma"):
+            chroma = Path(str(data["chroma"])).expanduser()
+        if data.get("collection"):
+            collection = str(data["collection"])
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass  # no config file is a normal state; presets are simply unset
+    for name, env in (("brain", "PFIND_BRAIN"), ("work", "PFIND_WORK"), ("src", "PFIND_SRC")):
+        if os.environ.get(env):
+            roots[name] = Path(os.environ[env]).expanduser()
+    if os.environ.get("PFIND_CHROMA"):
+        chroma = Path(os.environ["PFIND_CHROMA"]).expanduser()
+    if os.environ.get("PFIND_COLLECTION"):
+        collection = os.environ["PFIND_COLLECTION"]
+    return roots, chroma, collection
+
+PRESET_ROOTS, BRAIN_CHROMA, BRAIN_DEFAULT_COLLECTION = _load_preset_config()
+
+_PRESET_HELP = (
+    f"configure it in {PRESETS_CONFIG} "
+    '(e.g. {"brain": "~/notes", "work": "~/projects", "src": "~/src", '
+    '"chroma": "~/notes/chroma_db"}) or set PFIND_BRAIN / PFIND_WORK / PFIND_SRC'
+)
 
 EXCLUDE_GLOBS = [
     ".git", ".hg", ".svn", "node_modules", "__pycache__",
@@ -226,13 +287,34 @@ NERD_ICONS = {
 def c(code, s, use_color):
     return f"\033[{code}m{s}\033[0m" if use_color else s
 
+# Hostname token used in OSC 8 file:// targets. Overridable with --hostname-bin,
+# mirroring ripgrep-15.2.0 crates/core/flags/defs.rs HostnameBin.
+_HYPERLINK_HOST = MACHINE
+
+def resolve_hostname_bin(cmd):
+    """Run ``cmd`` and use its first output line as the OSC 8 hostname token."""
+    global _HYPERLINK_HOST
+    if not cmd:
+        return
+    try:
+        # ripgrep runs this as a program, not a shell line; shlex keeps argument
+        # handling predictable without invoking a shell.
+        out = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=5)
+        host = (out.stdout or "").strip().splitlines()
+        if out.returncode == 0 and host:
+            _HYPERLINK_HOST = host[0].strip()
+        else:
+            print(f"pfind: --hostname-bin {cmd!r} produced no hostname; keeping {MACHINE}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"pfind: --hostname-bin failed ({e}); keeping {MACHINE}", file=sys.stderr)
+
 def make_hyperlink(path, line=0, display_text=None, use_hyperlink=False, format_type="file"):
     text = display_text or path
     if not use_hyperlink:
         return text
-    
+
     abs_path = os.path.abspath(path)
-    
+
     if format_type == "vscode":
         # VSCode format: vscode://file/path:line
         target = f"vscode://file{abs_path}"
@@ -244,11 +326,79 @@ def make_hyperlink(path, line=0, display_text=None, use_hyperlink=False, format_
         if line > 0:
             target += f"#L{line}"
     else:  # file format (default)
-        target = f"file://{MACHINE}{abs_path}"
+        target = f"file://{_HYPERLINK_HOST}{abs_path}"
         if line > 0:
             target += f"#{line}"
-    
+
     return f"\033]8;;{target}\033\\{text}\033]8;;\033\\"
+
+# ---------------------------------------------------------------------------
+# --colors COLOR_SPEC (ripgrep-15.2.0 crates/core/flags/defs.rs, Colors)
+# ---------------------------------------------------------------------------
+# Spec grammar: {type}:{attribute}:{value} where type is path|line|column|match,
+# attribute is fg|bg|style, and value is a colour name, 0xRRGGBB, or a style
+# name. `{type}:none` clears the type. pfind renders its own output rather than
+# letting rg colour it, so the spec is resolved to ANSI codes here.
+_COLOR_NAMES = {
+    "black": 0, "red": 1, "green": 2, "yellow": 3,
+    "blue": 4, "magenta": 5, "cyan": 6, "white": 7,
+}
+_STYLE_NAMES = {
+    "bold": "1", "nobold": "22", "intense": "1", "nointense": "22",
+    "underline": "4", "nounderline": "24",
+}
+# Defaults match the codes pfind 3.0.0 hardcoded, so an unspecified type is unchanged.
+COLOR_SPEC = {"path": "1;32", "line": "1;33", "column": "1;33", "match": "1;31"}
+
+def _colour_value_to_code(value, is_bg):
+    value = value.strip().lower()
+    base = 40 if is_bg else 30
+    if value in _COLOR_NAMES:
+        return str(base + _COLOR_NAMES[value])
+    if value.startswith("0x") and len(value) == 8:
+        try:
+            r, g, b = int(value[2:4], 16), int(value[4:6], 16), int(value[6:8], 16)
+        except ValueError:
+            return None
+        return f"{base + 8};2;{r};{g};{b}"
+    if value.isdigit() and 0 <= int(value) <= 255:
+        return f"{base + 8};5;{value}"
+    return None
+
+def parse_color_specs(specs):
+    """Fold --colors specs into COLOR_SPEC. Invalid specs warn and are skipped."""
+    for raw in specs or []:
+        parts = raw.split(":")
+        if len(parts) < 2:
+            print(f"pfind: unrecognised --colors spec {raw!r} (want type:attribute:value)", file=sys.stderr)
+            continue
+        ctype = parts[0].strip().lower()
+        if ctype not in COLOR_SPEC:
+            print(f"pfind: unknown --colors type {ctype!r} (want path|line|column|match)", file=sys.stderr)
+            continue
+        if len(parts) == 2 and parts[1].strip().lower() == "none":
+            COLOR_SPEC[ctype] = ""
+            continue
+        if len(parts) < 3:
+            print(f"pfind: unrecognised --colors spec {raw!r} (want type:attribute:value)", file=sys.stderr)
+            continue
+        attr, value = parts[1].strip().lower(), ":".join(parts[2:])
+        existing = [x for x in COLOR_SPEC[ctype].split(";") if x]
+        if attr == "style":
+            code = _STYLE_NAMES.get(value.strip().lower())
+        elif attr in ("fg", "bg"):
+            code = _colour_value_to_code(value, attr == "bg")
+        else:
+            code = None
+        if code is None:
+            print(f"pfind: unrecognised --colors value in {raw!r}", file=sys.stderr)
+            continue
+        COLOR_SPEC[ctype] = ";".join(existing + [code]) if attr == "style" else code
+
+def cc(ctype, s, use_color):
+    """Colour ``s`` using the --colors entry for ``ctype``."""
+    code = COLOR_SPEC.get(ctype, "")
+    return c(code, s, use_color) if code else s
 
 # ---------------------------------------------------------------------------
 # Root & Scope Resolution
@@ -256,11 +406,14 @@ def make_hyperlink(path, line=0, display_text=None, use_hyperlink=False, format_
 def resolve_roots(paths, presets):
     roots = []
     for name in presets:
-        p = PRESET_ROOTS[name]
+        p = PRESET_ROOTS.get(name)
+        if p is None:
+            print(f"pfind: preset --{name} is not configured on this machine; {_PRESET_HELP}", file=sys.stderr)
+            continue
         if p.exists():
             roots.append(p)
         else:
-            print(f"pfind: preset --{name} path missing: {p}", file=sys.stderr)
+            print(f"pfind: preset --{name} points at {p}, which does not exist; {_PRESET_HELP}", file=sys.stderr)
     for raw in paths:
         p = Path(raw).expanduser().resolve()
         if p.exists():
@@ -518,8 +671,18 @@ def format_permissions(mode, octal=False):
 
 def format_timestamp(ts, style="relative"):
     dt = datetime.datetime.fromtimestamp(ts)
+    # eza-0.23.5 src/output/time.rs: default|iso|long-iso|full-iso|relative|+FORMAT
+    if style and style.startswith("+"):
+        try:
+            return dt.strftime(style[1:])
+        except ValueError:
+            return dt.strftime("%Y-%m-%d %H:%M")
     if style == "iso":
         return dt.strftime("%Y-%m-%d %H:%M:%S")
+    if style == "long-iso":
+        return dt.strftime("%Y-%m-%d %H:%M")
+    if style == "full-iso":
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f %z")
     now = datetime.datetime.now()
     delta = now - dt
     secs = delta.total_seconds()
@@ -555,9 +718,276 @@ def is_binary_file(path, sample_size=8192):
         return False
 
 # ---------------------------------------------------------------------------
+# Metadata Selection Helpers (eza-0.23.5 src/output/render/, src/fs/file.rs)
+# ---------------------------------------------------------------------------
+def get_file_stat(path, dereference=False):
+    """os.stat when --dereference (report the symlink target's metadata),
+    os.lstat otherwise (report the link itself), matching eza's -X."""
+    if dereference:
+        try:
+            return os.stat(path)
+        except OSError:
+            pass
+    return os.lstat(path)
+
+def pick_timestamp(st, field="modified"):
+    """Select the timestamp field named by --time / --changed / --accessed.
+    POSIX has no true birth time in os.stat_result on most Linux filesystems;
+    st_birthtime is used when the platform exposes it, else ctime, and the
+    substitution is visible here rather than silently presented as creation."""
+    if field == "accessed":
+        return st.st_atime
+    if field == "changed":
+        return st.st_ctime
+    if field == "created":
+        return getattr(st, "st_birthtime", st.st_ctime)
+    return st.st_mtime
+
+def classify_indicator(path, st=None):
+    """eza -F/--classify: append a type indicator to the name."""
+    try:
+        st = st or os.lstat(path)
+    except OSError:
+        return ""
+    mode = st.st_mode
+    if stat.S_ISDIR(mode):
+        return "/"
+    if stat.S_ISLNK(mode):
+        return "@"
+    if stat.S_ISFIFO(mode):
+        return "|"
+    if stat.S_ISSOCK(mode):
+        return "="
+    if mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+        return "*"
+    return ""
+
+_QUOTE_NEEDED = re.compile(r"[\s'\"\\$`|&;<>()*?\[\]{}!#~]")
+
+def quote_name(name, quotes_enabled):
+    """eza quotes names containing shell-significant characters; --no-quotes
+    turns that off (eza-0.23.5 src/output/file_name.rs)."""
+    if not quotes_enabled or not _QUOTE_NEEDED.search(name):
+        return name
+    if '"' in name:
+        return "'" + name + "'"
+    return '"' + name + '"'
+
+_NIX_STORE = re.compile(r"(/nix/store/)([a-z0-9]{32})-")
+
+def short_nix(path, enabled):
+    """eza --short-nix: elide the 32-char Nix store hash."""
+    if not enabled:
+        return path
+    return _NIX_STORE.sub(r"\1…-", path)
+
+def display_path(path, args):
+    """Apply --absolute and --short-nix to a path before display."""
+    mode = getattr(args, "absolute", "off") or "off"
+    if mode == "follow":
+        try:
+            path = os.path.realpath(path)
+        except OSError:
+            path = os.path.abspath(path)
+    elif mode == "on":
+        path = os.path.abspath(path)
+    return short_nix(path, getattr(args, "short_nix", False))
+
+def get_xattrs(path):
+    """eza -@/--extended: list extended attributes as (name, value_size)."""
+    if not hasattr(os, "listxattr"):
+        return []
+    try:
+        out = []
+        for name in os.listxattr(path, follow_symlinks=False):
+            try:
+                out.append((name, len(os.getxattr(path, name, follow_symlinks=False))))
+            except OSError:
+                out.append((name, 0))
+        return out
+    except OSError:
+        return []
+
+# BSD/macOS file flags (eza -O/--flags). Linux stat() carries no st_flags; the
+# nearest equivalent is the ext-family attribute set, read via lsattr when
+# present. Absence is reported as "-", never as "no flags set".
+_HAVE_LSATTR = shutil.which("lsattr") is not None
+
+def get_file_flags(path):
+    st_flags = None
+    try:
+        st_flags = getattr(os.lstat(path), "st_flags", None)
+    except OSError:
+        pass
+    if st_flags is not None:
+        return f"{st_flags:o}"
+    if _HAVE_LSATTR:
+        try:
+            out = subprocess.run(["lsattr", "-d", "--", path],
+                                 capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and out.stdout.strip():
+                attrs = out.stdout.split()[0].replace("-", "")
+                return attrs or "-"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "-"
+
+_MOUNT_CACHE = None
+
+def get_mount_info(path):
+    """eza -M/--mounts: device + filesystem type when ``path`` is a mount point."""
+    global _MOUNT_CACHE
+    if _MOUNT_CACHE is None:
+        _MOUNT_CACHE = {}
+        for src in ("/proc/self/mounts", "/etc/mtab"):
+            try:
+                with open(src, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            _MOUNT_CACHE[parts[1].replace("\\040", " ")] = (parts[0], parts[2])
+                break
+            except OSError:
+                continue
+    return _MOUNT_CACHE.get(os.path.abspath(path))
+
+# ---------------------------------------------------------------------------
+# Git Repository Summary (eza-0.23.5 --git-repos / --git-repos-no-status)
+# ---------------------------------------------------------------------------
+_GIT_REPO_CACHE: dict = {}
+
+def get_repo_summary(path, with_status=True):
+    """Branch name (+ dirty/clean when with_status) for a directory that is a
+    git work tree. Returns None for anything that is not one."""
+    if not HAVE_GIT or not os.path.isdir(path):
+        return None
+    key = (os.path.abspath(path), with_status)
+    if key in _GIT_REPO_CACHE:
+        return _GIT_REPO_CACHE[key]
+    result = None
+    try:
+        top = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=5)
+        # Only label the repository root itself, as eza does — not every
+        # directory that happens to sit inside a checkout.
+        if top.returncode == 0 and os.path.abspath(top.stdout.strip()) == os.path.abspath(path):
+            branch = subprocess.run(["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
+                                    capture_output=True, text=True, timeout=5)
+            name = branch.stdout.strip() if branch.returncode == 0 else "?"
+            if not with_status:
+                result = name
+            else:
+                dirty = subprocess.run(["git", "-C", path, "status", "--porcelain"],
+                                       capture_output=True, text=True, timeout=10)
+                state = "dirty" if (dirty.returncode == 0 and dirty.stdout.strip()) else "clean"
+                result = f"{name}|{state}"
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    _GIT_REPO_CACHE[key] = result
+    return result
+
+def git_ignored_filter(paths):
+    """Drop paths that git would ignore. Used by the pure-Python listing path
+    for --git-ignore; the ripgrep path already honours .gitignore natively."""
+    if not HAVE_GIT or not paths:
+        return paths
+    by_repo = defaultdict(list)
+    for p in paths:
+        d = p if os.path.isdir(p) else os.path.dirname(p) or "."
+        try:
+            top = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
+                                 capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if top.returncode == 0 and top.stdout.strip():
+            by_repo[top.stdout.strip()].append(p)
+    ignored = set()
+    for repo, group in by_repo.items():
+        try:
+            proc = subprocess.run(["git", "-C", repo, "check-ignore", "--stdin"],
+                                  input="\n".join(group), capture_output=True,
+                                  text=True, timeout=30)
+            # exit 0 = some paths ignored, 1 = none, >1 = real error
+            if proc.returncode in (0, 1):
+                ignored.update(line for line in proc.stdout.splitlines() if line)
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return [p for p in paths if p not in ignored]
+
+# ---------------------------------------------------------------------------
 # Search Engine: ripgrep 15.2.0 Ingestion with Context Windowing
 # ---------------------------------------------------------------------------
-def rg_list_files(roots, ext_filter, extra_excludes, type_globs, include_hidden, no_ignore, workers, max_depth=None, globs=()):
+def rg_walk_flags(opts):
+    """Translate the directory-traversal / ignore-layer / resource options into
+    ripgrep arguments. Applies to both `rg --files` and `rg --json` so that a
+    listing and a search see exactly the same file set."""
+    if opts is None:
+        return []
+    g = lambda n, d=False: getattr(opts, n, d)
+    out = []
+    for name, flag in (
+        ("no_ignore_dot", "--no-ignore-dot"),
+        ("no_ignore_global", "--no-ignore-global"),
+        ("no_ignore_parent", "--no-ignore-parent"),
+        ("no_ignore_vcs", "--no-ignore-vcs"),
+        ("no_ignore_exclude", "--no-ignore-exclude"),
+        ("no_ignore_messages", "--no-ignore-messages"),
+        ("no_require_git", "--no-require-git"),
+        ("one_file_system", "--one-file-system"),
+        ("glob_case_insensitive", "--glob-case-insensitive"),
+        ("no_config", "--no-config"),
+        ("follow_symlinks", "--follow"),
+    ):
+        if g(name):
+            out.append(flag)
+    if g("max_filesize", None):
+        out += ["--max-filesize", str(g("max_filesize"))]
+    for ig in (g("iglobs", None) or []):
+        out += ["--iglob", ig]
+    for f in (g("ignore_files", None) or []):
+        out += ["--ignore-file", f]
+    if g("ignore_file_case_insensitive"):
+        out.append("--ignore-file-case-insensitive")
+    if g("mmap"):
+        out.append("--mmap")
+    if g("no_mmap"):
+        out.append("--no-mmap")
+    return out
+
+def rg_match_flags(opts):
+    """Translate the matcher / engine / I/O options into ripgrep arguments.
+    Search-only; these have no meaning for `rg --files`."""
+    if opts is None:
+        return []
+    g = lambda n, d=False: getattr(opts, n, d)
+    out = []
+    for name, flag in (
+        ("text", "--text"),
+        ("binary", "--binary"),
+        ("line_regexp", "--line-regexp"),
+        ("crlf", "--crlf"),
+        ("null_data", "--null-data"),
+        ("no_unicode", "--no-unicode"),
+        ("stop_on_nonmatch", "--stop-on-nonmatch"),
+        ("passthru", "--passthru"),
+        ("block_buffered", "--block-buffered"),
+        ("line_buffered", "--line-buffered"),
+    ):
+        if g(name):
+            out.append(flag)
+    if g("max_count", 0):
+        out += ["--max-count", str(g("max_count"))]
+    if g("encoding", None):
+        out += ["--encoding", str(g("encoding"))]
+    if g("engine", None) and g("engine") != "default":
+        out += ["--engine", str(g("engine"))]
+    if g("dfa_size_limit", None):
+        out += ["--dfa-size-limit", str(g("dfa_size_limit"))]
+    if g("regex_size_limit", None):
+        out += ["--regex-size-limit", str(g("regex_size_limit"))]
+    return out
+
+def rg_list_files(roots, ext_filter, extra_excludes, type_globs, include_hidden, no_ignore, workers, max_depth=None, globs=(), opts=None):
     cmd = ["rg", "--files", "--threads", str(workers)]
     if include_hidden:
         cmd.append("--hidden")
@@ -565,6 +995,7 @@ def rg_list_files(roots, ext_filter, extra_excludes, type_globs, include_hidden,
         cmd.append("--no-ignore")
     if max_depth:
         cmd += ["--max-depth", str(max_depth)]
+    cmd += rg_walk_flags(opts)
     cmd += rg_common_globs(ext_filter, extra_excludes, type_globs, globs)
     cmd += [str(r) for r in roots]
     try:
@@ -572,6 +1003,10 @@ def rg_list_files(roots, ext_filter, extra_excludes, type_globs, include_hidden,
     except (subprocess.TimeoutExpired, OSError) as e:
         print(f"pfind: rg --files failed ({e}); fallback enumeration", file=sys.stderr)
         return []
+    if out.returncode not in (0, 1) and not getattr(opts, "no_messages", False):
+        msg = (out.stderr or "").strip().splitlines()
+        if msg:
+            print(f"pfind: rg --files: {msg[0]}", file=sys.stderr)
     return [line for line in out.stdout.splitlines() if line]
 
 def rg_content(pattern, roots, regex, ignore_case, case_sensitive, word_regexp,
@@ -579,13 +1014,15 @@ def rg_content(pattern, roots, regex, ignore_case, case_sensitive, word_regexp,
                workers, max_per_file, fixed=None, multiline=False, search_zip=False,
                context_before=0, context_after=0, max_depth=None, pcre2=False,
                invert_match=False, timeout=600, extract_column=False,
-               pre=None, pre_glob=None, globs=()):
+               pre=None, pre_glob=None, globs=(), opts=None, only_matching=False,
+               smart_case=False):
     if fixed is None:
         fixed = not regex
     cmd = ["rg", "--json", "--threads", str(workers)]
+    # -s wins over -i wins over -S, matching ripgrep's own precedence.
     if case_sensitive:
         cmd.append("-s")
-    elif ignore_case:
+    elif ignore_case and not smart_case:
         cmd.append("-i")
     else:
         cmd.append("-S")
@@ -594,7 +1031,10 @@ def rg_content(pattern, roots, regex, ignore_case, case_sensitive, word_regexp,
     if word_regexp:
         cmd.append("-w")
     if multiline:
-        cmd += ["-U", "--multiline-dotall"]
+        cmd.append("-U")
+        # -x/--loose need dotall to span lines; -U alone does not imply it.
+        if getattr(opts, "multiline_dotall", False) or getattr(opts, "exact", False) or getattr(opts, "loose", False):
+            cmd.append("--multiline-dotall")
     if search_zip:
         cmd.append("-z")
     if pcre2:
@@ -618,6 +1058,8 @@ def rg_content(pattern, roots, regex, ignore_case, case_sensitive, word_regexp,
     if pre_glob:
         cmd += ["--pre-glob", pre_glob]
 
+    cmd += rg_walk_flags(opts)
+    cmd += rg_match_flags(opts)
     cmd += rg_common_globs(ext_filter, extra_excludes, type_globs, globs)
     cmd += ["-e", pattern, "--"]
     cmd += [str(r) for r in roots]
@@ -627,8 +1069,13 @@ def rg_content(pattern, roots, regex, ignore_case, case_sensitive, word_regexp,
     except (subprocess.TimeoutExpired, OSError) as e:
         print(f"pfind: rg content search failed: {e}", file=sys.stderr)
         return {}
+    if proc.returncode not in (0, 1) and not getattr(opts, "no_messages", False):
+        msg = (proc.stderr or "").strip().splitlines()
+        if msg:
+            print(f"pfind: rg: {msg[0]}", file=sys.stderr)
 
-    hits = defaultdict(lambda: {"count": 0, "samples": [], "terms": set(), "lines_data": []})
+    hits = defaultdict(lambda: {"count": 0, "samples": [], "terms": set(),
+                                "lines_data": [], "offsets": {}})
     for line in proc.stdout.splitlines():
         try:
             obj = json.loads(line)
@@ -644,6 +1091,8 @@ def rg_content(pattern, roots, regex, ignore_case, case_sensitive, word_regexp,
         rec = hits[path]
         text = (d.get("lines", {}).get("text") or "").rstrip("\n")
         lineno = d.get("line_number", 0)
+        if d.get("absolute_offset") is not None:
+            rec["offsets"][lineno] = d["absolute_offset"]
 
         if msg_type == "match":
             rec["count"] += 1
@@ -651,11 +1100,20 @@ def rg_content(pattern, roots, regex, ignore_case, case_sensitive, word_regexp,
             if extract_column and d.get("submatches"):
                 # Get column of first match
                 col = d["submatches"][0].get("start", 0) + 1  # 1-indexed
-            
+
             for sm in d.get("submatches", []):
                 mt = (sm.get("match") or {}).get("text")
                 if mt:
                     rec["terms"].add(mt.lower()[:40])
+
+            if only_matching:
+                # -o: the matched substrings replace the whole line, which is
+                # what `rg -o` prints (one per match; joined here because pfind
+                # renders one row per source line).
+                parts = [(sm.get("match") or {}).get("text") or "" for sm in d.get("submatches", [])]
+                parts = [p for p in parts if p]
+                if parts:
+                    text = " ".join(parts)
             if len(rec["samples"]) < max_per_file:
                 sample = (lineno, text[:220] + "…" if len(text) > 220 else text, col) if extract_column else (lineno, text[:220] + "…" if len(text) > 220 else text)
                 rec["samples"].append(sample)
@@ -668,14 +1126,44 @@ def rg_content(pattern, roots, regex, ignore_case, case_sensitive, word_regexp,
 # ---------------------------------------------------------------------------
 # Pure-Python Fallback Engine (with Decompression & Context Support)
 # ---------------------------------------------------------------------------
-def py_fallback_files(roots, ext_filter, extra_excludes, type_globs, max_depth=None, include_dirs=False, include_hidden=False, globs=()):
+def parse_size_arg(text):
+    """Parse ripgrep's NUM[KMG] size syntax (--max-filesize, --*-size-limit)."""
+    if text is None:
+        return None
+    s = str(text).strip().upper()
+    mult = 1
+    if s and s[-1] in "KMG":
+        mult = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}[s[-1]]
+        s = s[:-1]
+    try:
+        return int(float(s) * mult)
+    except ValueError:
+        print(f"pfind: unrecognised size value {text!r}; ignoring", file=sys.stderr)
+        return None
+
+def py_fallback_files(roots, ext_filter, extra_excludes, type_globs, max_depth=None,
+                      include_dirs=False, include_hidden=False, globs=(), opts=None):
     excl_names = {g for g in EXCLUDE_GLOBS if "*" not in g} | set(extra_excludes)
     excl_prefix = tuple(g[:-1] for g in EXCLUDE_GLOBS if g.endswith("*"))
+    g = (lambda n, d=False: getattr(opts, n, d)) if opts is not None else (lambda n, d=False: d)
+    max_bytes = parse_size_arg(g("max_filesize", None))
+    one_fs = g("one_file_system")
+    follow = g("follow_symlinks")
+    treat_dirs_as_files = g("treat_dirs_as_files")
+    iglobs = [ig.lower() for ig in (g("iglobs", None) or [])]
     files = []
     for root in roots:
         root_path = Path(root)
         root_depth = len(root_path.parts)
-        for dirpath, dirnames, filenames in os.walk(root):
+        try:
+            root_dev = os.stat(root).st_dev if one_fs else None
+        except OSError:
+            root_dev = None
+        if treat_dirs_as_files and os.path.isdir(root):
+            # --treat-dirs-as-files: the directory is the entry; do not descend.
+            files.append(str(root))
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=follow):
             if not include_hidden:
                 dirnames[:] = [d for d in dirnames if not d.startswith('.')]
                 filenames = [f for f in filenames if not f.startswith('.')]
@@ -684,86 +1172,187 @@ def py_fallback_files(roots, ext_filter, extra_excludes, type_globs, max_depth=N
                 if cur_depth >= max_depth:
                     dirnames.clear()
             dirnames[:] = [d for d in dirnames if d not in excl_names and not d.startswith(excl_prefix)]
+            if one_fs and root_dev is not None:
+                kept = []
+                for d in dirnames:
+                    try:
+                        if os.stat(os.path.join(dirpath, d)).st_dev == root_dev:
+                            kept.append(d)
+                    except OSError:
+                        pass
+                dirnames[:] = kept
             if include_dirs and dirpath != str(root):
                 files.append(dirpath)
             for fn in filenames:
                 ext = Path(fn).suffix.lower()
                 if ext_filter and ext not in ext_filter:
                     continue
-                files.append(os.path.join(dirpath, fn))
+                fp = os.path.join(dirpath, fn)
+                if max_bytes is not None:
+                    try:
+                        if os.lstat(fp).st_size > max_bytes:
+                            continue
+                    except OSError:
+                        continue
+                files.append(fp)
+    if type_globs:
+        # -t/--type resolves to the same override globs ripgrep receives; the
+        # pure-Python path applied them nowhere before, so -t silently matched
+        # everything whenever ripgrep was absent.
+        files = _apply_user_globs(files, list(type_globs), is_dir=False)
     if globs:
         files = _apply_user_globs(files, globs, is_dir=False)
+    if iglobs:
+        # --iglob is --glob with case folded on both sides; reuse the same
+        # override semantics rather than duplicating them.
+        lowered = [f.lower() for f in files]
+        keep = set(_apply_user_globs(lowered, iglobs, is_dir=False))
+        files = [f for f, low in zip(files, lowered) if low in keep]
+    if g("git_ignore"):
+        files = git_ignored_filter(files)
     return files
+
+def _read_lines(fp, search_zip, encoding):
+    """Read a file as text lines, transparently decompressing when --search-zip
+    is on. gz/bz2/xz/lzma stream directly; zip and tar are containers, so their
+    members are concatenated in archive order."""
+    enc = encoding or "utf-8"
+    if search_zip:
+        low = fp.lower()
+        if low.endswith((".gz", ".tgz")) and not low.endswith(".tar.gz"):
+            with gzip.open(fp, "rt", encoding=enc, errors="ignore") as f:
+                return f.readlines()
+        if low.endswith(".bz2") and not low.endswith(".tar.bz2"):
+            with bz2.open(fp, "rt", encoding=enc, errors="ignore") as f:
+                return f.readlines()
+        if low.endswith((".xz", ".lzma")) and not low.endswith(".tar.xz"):
+            with lzma.open(fp, "rt", encoding=enc, errors="ignore") as f:
+                return f.readlines()
+        if low.endswith(".zip"):
+            lines = []
+            with zipfile.ZipFile(fp) as z:
+                for name in z.namelist():
+                    if name.endswith("/"):
+                        continue
+                    with z.open(name) as member:
+                        lines.extend(member.read().decode(enc, "ignore").splitlines(keepends=True))
+            return lines
+        if tarfile.is_tarfile(fp):
+            lines = []
+            with tarfile.open(fp) as t:
+                for member in t.getmembers():
+                    if not member.isfile():
+                        continue
+                    handle = t.extractfile(member)
+                    if handle is None:
+                        continue
+                    lines.extend(handle.read().decode(enc, "ignore").splitlines(keepends=True))
+            return lines
+    with open(fp, "r", encoding=enc, errors="ignore") as f:
+        return f.readlines()
 
 def py_fallback_content(pattern, files, regex, ignore_case, case_sensitive, word_regexp,
                         max_per_file, search_zip=False, context_before=0, context_after=0,
-                        invert_match=False):
-    import re
+                        invert_match=False, opts=None, only_matching=False):
+    g = (lambda n, d=False: getattr(opts, n, d)) if opts is not None else (lambda n, d=False: d)
+    max_count = g("max_count", 0) or 0
+    encoding = g("encoding", None)
+    passthru = g("passthru")
+    line_regexp = g("line_regexp")
+    treat_as_text = g("text") or g("binary")
+    stop_on_nonmatch = g("stop_on_nonmatch")
+    no_messages = g("no_messages")
+    max_bytes = parse_size_arg(g("max_filesize", None))
+
     flags = re.IGNORECASE if (ignore_case and not case_sensitive) else 0
     if word_regexp:
-        pattern = r"\b" + (pattern if regex else re.escape(pattern)) + r"\b"
-        matcher = re.compile(pattern, flags).search
+        rx_src = r"\b" + (pattern if regex else re.escape(pattern)) + r"\b"
+        compiled = re.compile(rx_src, flags)
+    elif line_regexp:
+        rx_src = r"^(?:" + (pattern if regex else re.escape(pattern)) + r")$"
+        compiled = re.compile(rx_src, flags)
     elif regex:
-        matcher = re.compile(pattern, flags).search
+        compiled = re.compile(pattern, flags)
     else:
-        needle = pattern.lower() if flags else pattern
-        matcher = (lambda s: needle in s.lower()) if flags else (lambda s: pattern in s)
+        compiled = re.compile(re.escape(pattern), flags)
+    matcher = compiled.search
 
     hits = {}
     for fp in files:
-        if not search_zip and is_binary_file(fp):
+        if not search_zip and not treat_as_text and is_binary_file(fp):
             continue
+        if max_bytes is not None:
+            try:
+                if os.lstat(fp).st_size > max_bytes:
+                    continue
+            except OSError:
+                continue
         try:
-            lines = []
-            if search_zip and fp.endswith((".gz", ".tgz")):
-                with gzip.open(fp, "rt", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()
-            elif search_zip and fp.endswith(".bz2"):
-                with bz2.open(fp, "rt", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()
-            elif search_zip and fp.endswith(".xz"):
-                with lzma.open(fp, "rt", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()
-            else:
-                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()
+            lines = _read_lines(fp, search_zip, encoding)
 
             match_indices = []
             for i, line in enumerate(lines):
-                is_m = bool(matcher(line))
+                is_m = bool(matcher(line.rstrip("\n") if line_regexp else line))
                 if invert_match:
                     is_m = not is_m
                 if is_m:
                     match_indices.append(i)
+                    if max_count and len(match_indices) >= max_count:
+                        break
+                elif stop_on_nonmatch and match_indices:
+                    break
 
             if not match_indices:
                 continue
+
+            def render_line(idx):
+                """-o prints the matched substrings in place of the line."""
+                raw = lines[idx].rstrip("\n")
+                if not only_matching:
+                    return raw
+                found = [m.group(0) for m in compiled.finditer(raw)]
+                return " ".join(found) if found else raw
 
             samples = []
             lines_data = []
             for idx in match_indices:
                 if len(samples) < max_per_file:
-                    s = lines[idx].strip()
+                    s = render_line(idx).strip()
                     samples.append((idx + 1, s[:220] + "…" if len(s) > 220 else s))
 
-            # build context windows
+            # build context windows (--passthru widens the window to the file)
             included_lines = set()
-            for idx in match_indices:
-                start = max(0, idx - context_before)
-                end = min(len(lines), idx + context_after + 1)
-                for li in range(start, end):
-                    included_lines.add(li)
+            if passthru:
+                included_lines.update(range(len(lines)))
+            else:
+                for idx in match_indices:
+                    start = max(0, idx - context_before)
+                    end = min(len(lines), idx + context_after + 1)
+                    included_lines.update(range(start, end))
+
+            match_set = set(match_indices)
+            offsets, running = {}, 0
+            need_offsets = bool(g("byte_offset"))
+            if need_offsets:
+                for i, line in enumerate(lines):
+                    offsets[i + 1] = running
+                    running += len(line.encode(encoding or "utf-8", "ignore"))
 
             for li in sorted(included_lines):
-                lines_data.append((li + 1, lines[li].rstrip("\n"), li in match_indices))
+                is_match = li in match_set
+                text = render_line(li) if is_match else lines[li].rstrip("\n")
+                lines_data.append((li + 1, text, is_match))
 
             hits[fp] = {
                 "count": len(match_indices),
                 "samples": samples,
                 "terms": {pattern.lower()[:40]},
                 "lines_data": lines_data,
+                "offsets": offsets,
             }
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError, EOFError, zipfile.BadZipFile, tarfile.TarError, lzma.LZMAError) as e:
+            if not no_messages:
+                print(f"pfind: {fp}: {e}", file=sys.stderr)
             continue
     return hits
 
@@ -826,6 +1415,9 @@ def semantic_brain(query, collection, top_k):
         import chromadb
     except ImportError:
         print("pfind: --brain semantic needs chromadb (import failed); using lexical only.", file=sys.stderr)
+        return []
+    if BRAIN_CHROMA is None:
+        print(f"pfind: no Chroma store configured for --brain; {_PRESET_HELP}; lexical only.", file=sys.stderr)
         return []
     if not BRAIN_CHROMA.exists():
         print(f"pfind: brain store not found at {BRAIN_CHROMA}; lexical only.", file=sys.stderr)
@@ -904,7 +1496,11 @@ def render_tree_view(fused_paths, content_hits, git_cache, args, use_color):
 # ---------------------------------------------------------------------------
 # Code Summary View Engine (from eza-0.23.5 src/loc/mod.rs)
 # ---------------------------------------------------------------------------
-def render_code_summary_table(files, use_color):
+def render_code_summary_table(files, use_color, mode="both"):
+    """--code[=lines|percent|both]: aggregate LOC by language. ``lines`` prints
+    raw counts, ``percent`` prints each column as a share of that language's
+    total lines, ``both`` prints counts with the share alongside."""
+    mode = mode if mode in ("lines", "percent", "both") else "both"
     summary = defaultdict(LocCounts)
     for fp in files:
         res = classify_file_loc(fp)
@@ -921,13 +1517,20 @@ def render_code_summary_table(files, use_color):
     print(f"{'Language':<24} {'Total Lines':>12} {'Code':>10} {'Comments':>10} {'Blanks':>10}")
     print(f"{'-' * 70}")
 
+    def cell(value, total):
+        if mode == "percent":
+            return f"{(value * 100 / max(total, 1)):>9.1f}%"
+        if mode == "both":
+            return f"{value:>5,d} ({value * 100 // max(total, 1):>2d}%)"
+        return f"{value:>10,d}"
+
     grand_total = LocCounts()
     for lang, counts in sorted(summary.items(), key=lambda kv: -kv[1].code):
         grand_total.add(counts)
         lang_str = f"{lang:<24}"
-        code_str = f"{counts.code:>10,d}"
-        comm_str = f"{counts.comments:>10,d}"
-        blnk_str = f"{counts.blanks:>10,d}"
+        code_str = cell(counts.code, counts.lines)
+        comm_str = cell(counts.comments, counts.lines)
+        blnk_str = cell(counts.blanks, counts.lines)
         print(f"{c('1;36', lang_str, use_color)} {counts.lines:>12,d} "
               f"{c('32', code_str, use_color)} "
               f"{c('33', comm_str, use_color)} "
@@ -935,9 +1538,9 @@ def render_code_summary_table(files, use_color):
 
     print(f"{'=' * 70}")
     tot_lang = f"{'TOTAL':<24}"
-    tot_code = f"{grand_total.code:>10,d}"
-    tot_comm = f"{grand_total.comments:>10,d}"
-    tot_blnk = f"{grand_total.blanks:>10,d}"
+    tot_code = cell(grand_total.code, grand_total.lines)
+    tot_comm = cell(grand_total.comments, grand_total.lines)
+    tot_blnk = cell(grand_total.blanks, grand_total.lines)
     print(f"{c('1;37', tot_lang, use_color)} {grand_total.lines:>12,d} "
           f"{c('1;32', tot_code, use_color)} "
           f"{c('1;33', tot_comm, use_color)} "
@@ -946,7 +1549,7 @@ def render_code_summary_table(files, use_color):
 # ---------------------------------------------------------------------------
 # Directory Size & Color Scale Engines (from eza-0.23.5)
 # ---------------------------------------------------------------------------
-_DIR_SIZE_CACHE = {}
+_DIR_SIZE_CACHE: dict = {}
 def get_dir_total_size(path):
     """Recursively calculate total bytes contained in a directory."""
     if path in _DIR_SIZE_CACHE:
@@ -965,10 +1568,24 @@ def get_dir_total_size(path):
     _DIR_SIZE_CACHE[path] = total
     return total
 
-def get_scale_color(val, kind="size", use_color=True):
-    """Calculate ANSI color code based on size magnitude or recency delta."""
+def get_scale_color(val, kind="size", use_color=True, mode="fixed"):
+    """ANSI colour for a size magnitude or a recency delta.
+
+    ``fixed`` picks from discrete bands (the 3.0.0 behaviour). ``gradient``
+    interpolates a 256-colour ramp across the magnitude, which is what eza's
+    --color-scale-mode=gradient does (eza-0.23.5 src/output/render/size.rs).
+    """
     if not use_color:
         return ""
+    if mode == "gradient":
+        if kind == "size":
+            # log10 ramp: 0 B .. 1 GiB spread over the green->red arc
+            frac = min(1.0, math.log10(max(float(val), 1.0)) / 9.0)
+        else:
+            # 0 .. 90 days
+            frac = min(1.0, float(val) / (86400.0 * 90.0))
+        ramp = [46, 82, 118, 154, 190, 226, 220, 214, 208, 202, 196]
+        return f"38;5;{ramp[int(frac * (len(ramp) - 1))]}"
     if kind == "size":
         if val < 1024:
             return "32"           # < 1 KiB: green
@@ -994,7 +1611,32 @@ def get_scale_color(val, kind="size", use_color=True):
 # ---------------------------------------------------------------------------
 # Long Details View Engine (from eza-0.23.5 src/output/table.rs)
 # ---------------------------------------------------------------------------
+def format_loc_badge(counts, mode):
+    """--loc=lines|percent|both (eza-0.23.5 CodeContent)."""
+    total = max(counts.lines, 1)
+    if mode == "lines":
+        return f"[code:{counts.code} com:{counts.comments}]"
+    if mode == "percent":
+        return f"[code:{counts.code * 100 // total}% com:{counts.comments * 100 // total}%]"
+    return (f"[code:{counts.code} ({counts.code * 100 // total}%) "
+            f"com:{counts.comments} ({counts.comments * 100 // total}%)]")
+
 def render_long_table(paths, content_hits, git_cache, args, use_color):
+    show_perms = not getattr(args, "no_permissions", False)
+    show_size = not getattr(args, "no_filesize", False)
+    show_user = not getattr(args, "no_user", False)
+    show_time = not getattr(args, "no_time", False)
+    # pfind's long view always carries a group column (eza gates it behind -g);
+    # --group asks for it explicitly and so overrides --smart-group's hiding.
+    smart_group = getattr(args, "smart_group", False) and not getattr(args, "group", False)
+    numeric = getattr(args, "numeric", False)
+    deref = getattr(args, "dereference", False)
+    time_field = getattr(args, "time", "modified")
+    scale_mode = getattr(args, "color_scale_mode", "fixed")
+    quotes = not getattr(args, "no_quotes", False)
+    classify = getattr(args, "classify", False)
+    repos_mode = getattr(args, "git_repos", False) or getattr(args, "git_repos_no_status", False)
+
     # Print header if requested
     if args.header:
         header_parts = []
@@ -1004,20 +1646,28 @@ def render_long_table(paths, content_hits, git_cache, args, use_color):
             header_parts.append(f"{'BLOCKS':<10}")
         if args.links:
             header_parts.append(f"{'LINKS':<6}")
-        header_parts.append(f"{'PERMISSIONS':<10}")
+        if getattr(args, "flags", False):
+            header_parts.append(f"{'FLAGS':<8}")
+        if show_perms:
+            header_parts.append(f"{'PERMISSIONS':<10}")
         header_parts.append(f"{'GIT':<3}")
-        header_parts.append(f"{'USER':<8}")
+        if show_user:
+            header_parts.append(f"{'USER':<8}")
         header_parts.append(f"{'GROUP':<8}")
-        header_parts.append(f"{'SIZE':>9}")
-        header_parts.append(f"{'MODIFIED':<12}")
+        if show_size:
+            header_parts.append(f"{'SIZE':>9}")
+        if show_time:
+            header_parts.append(f"{time_field.upper():<12}")
+        if repos_mode:
+            header_parts.append(f"{'REPO':<20}")
         header_parts.append("NAME")
         print(c("1;37", " ".join(header_parts), use_color))
-    
+
     for path in paths:
         try:
-            st = os.lstat(path)
+            st = get_file_stat(path, deref)
             is_dir = stat.S_ISDIR(st.st_mode)
-            
+
             # Build metadata columns
             meta_cols = []
             if args.inode:
@@ -1027,9 +1677,11 @@ def render_long_table(paths, content_hits, git_cache, args, use_color):
                 meta_cols.append(f"{blocks:<10}")
             if args.links:
                 meta_cols.append(f"{st.st_nlink:<6}")
-            
+            if getattr(args, "flags", False):
+                meta_cols.append(f"{get_file_flags(path):<8}")
+
             mode_str = format_permissions(st.st_mode, args.octal_permissions)
-            
+
             # Handle size display modes
             if getattr(args, 'total_size', False) and is_dir:
                 raw_size = get_dir_total_size(path)
@@ -1040,38 +1692,79 @@ def render_long_table(paths, content_hits, git_cache, args, use_color):
                 size_str = str(raw_size)
             else:
                 size_str = format_size(raw_size, not args.metric_units)
-            
-            time_str = format_timestamp(st.st_mtime, args.time_style)
-            user_str = pwd.getpwuid(st.st_uid).pw_name if hasattr(pwd, "getpwuid") else str(st.st_uid)
-            group_str = grp.getgrgid(st.st_gid).gr_name if hasattr(grp, "getgrgid") else str(st.st_gid)
+
+            ts = pick_timestamp(st, time_field)
+            time_str = format_timestamp(ts, args.time_style)
+            if numeric:
+                user_str, group_str = str(st.st_uid), str(st.st_gid)
+            else:
+                try:
+                    user_str = pwd.getpwuid(st.st_uid).pw_name
+                except (KeyError, AttributeError):
+                    user_str = str(st.st_uid)
+                try:
+                    group_str = grp.getgrgid(st.st_gid).gr_name
+                except (KeyError, AttributeError):
+                    group_str = str(st.st_gid)
+            # --smart-group: show the group only when it differs from the owner
+            if smart_group and group_str == user_str:
+                group_str = ""
             icon = get_file_icon(path, is_dir) if args.icons else ""
             git_st = git_cache.get_status(path) if git_cache and args.git else None
             git_badge = f"{c('31;1', f'{git_st:<3}', use_color)}" if git_st else "   "
+
+            repo_col = ""
+            if repos_mode:
+                summary = get_repo_summary(path, with_status=not getattr(args, "git_repos_no_status", False))
+                cell = f"{summary or '-':<20}"
+                repo_col = c('35', cell, use_color) + " "
 
             loc_badge = ""
             if args.loc:
                 loc_res = classify_file_loc(path)
                 if loc_res:
                     _, lc = loc_res
-                    loc_badge = f" [code:{lc.code} com:{lc.comments}]"
+                    loc_badge = " " + format_loc_badge(lc, args.loc if isinstance(args.loc, str) else "both")
 
-            path_display = make_hyperlink(path, 0, path, args.hyperlink, args.hyperlink_format)
-            
+            shown_path = display_path(path, args)
+            name_text = quote_name(shown_path, quotes) + (classify_indicator(path, st) if classify else "")
+            path_display = make_hyperlink(path, 0, name_text, args.hyperlink, args.hyperlink_format)
+
             # Colors
             if getattr(args, 'color_scale', False):
-                size_color = get_scale_color(raw_size, "size", use_color)
-                time_color = get_scale_color(time.time() - st.st_mtime, "age", use_color)
+                size_color = get_scale_color(raw_size, "size", use_color, scale_mode)
+                time_color = get_scale_color(time.time() - ts, "age", use_color, scale_mode)
             else:
                 size_color = "33"
                 time_color = "36"
 
             meta_prefix = " ".join(meta_cols) + " " if meta_cols else ""
-            print(f"{meta_prefix}{c('90', f'{mode_str:<10}', use_color)} {git_badge} {user_str:<8} {group_str:<8} "
-                  f"{c(size_color, f'{size_str:>9}', use_color)} {c(time_color, f'{time_str:<12}', use_color)} "
-                  f"{icon + ' ' if icon else ''}{c('1;32', path_display, use_color)}{loc_badge}")
+            row = meta_prefix
+            if show_perms:
+                row += c('90', f'{mode_str:<10}', use_color) + " "
+            row += git_badge + " "
+            if show_user:
+                row += f"{user_str:<8} "
+            row += f"{group_str:<8} "
+            if show_size:
+                row += c(size_color, f'{size_str:>9}', use_color) + " "
+            if show_time:
+                row += c(time_color, f'{time_str:<12}', use_color) + " "
+            row += repo_col
+            row += f"{icon + ' ' if icon else ''}{cc('path', path_display, use_color)}{loc_badge}"
+            if getattr(args, "mounts", False):
+                mount = get_mount_info(path)
+                if mount:
+                    row += c('90', f"  [{mount[0]} {mount[1]}]", use_color)
+            print(row)
+
+            if getattr(args, "extended", False):
+                for xname, xsize in get_xattrs(path):
+                    print(c('90', f"        {xname} ({xsize} bytes)", use_color))
 
             if path in content_hits:
-                for lineno, text in content_hits[path].get("samples", []):
+                for sample in content_hits[path].get("samples", []):
+                    lineno, text = sample[0], sample[1]
                     line_display = make_hyperlink(path, lineno, f"{lineno}:", args.hyperlink, args.hyperlink_format)
                     print(f"    {c('90', line_display, use_color)} {text}")
         except OSError:
@@ -1080,61 +1773,89 @@ def render_long_table(paths, content_hits, git_cache, args, use_color):
 # ---------------------------------------------------------------------------
 # Grid Layout Rendering (from eza-0.23.5 src/output/grid.rs)
 # ---------------------------------------------------------------------------
+def grid_terminal_width(args):
+    """--width overrides the detected terminal width (eza -w/--width)."""
+    override = getattr(args, "width", None)
+    if override:
+        return max(1, int(override))
+    return shutil.get_terminal_size((80, 24)).columns
+
 def render_grid(paths, use_color, args, terminal_width=None):
-    """Render paths in multi-column grid layout."""
+    """Render paths in a multi-column grid.
+
+    eza fills columns downwards by default and across rows with -x/--across
+    (eza-0.23.5 src/output/grid.rs). pfind 3.0.0 only ever filled across; the
+    down-column layout is now the default to match eza.
+    """
     if not paths:
         return
-    
+
     if terminal_width is None:
-        terminal_width = shutil.get_terminal_size((80, 24)).columns
-    
-    # Calculate column width based on longest path
-    max_len = max((len(os.path.basename(p)) for p in paths), default=0)
-    icon_width = 2 if args.icons else 0
-    col_width = max_len + icon_width + 2  # padding
-    
-    if col_width == 0:
-        col_width = 20
-    
-    num_cols = max(1, terminal_width // col_width)
-    
-    for i, path in enumerate(paths):
+        terminal_width = grid_terminal_width(args)
+
+    quotes = not getattr(args, "no_quotes", False)
+    classify = getattr(args, "classify", False)
+
+    cells = []
+    for path in paths:
         icon = get_file_icon(path, os.path.isdir(path)) if args.icons else ""
-        basename = os.path.basename(path)
+        name = quote_name(os.path.basename(short_nix(path, getattr(args, "short_nix", False))), quotes)
+        if classify:
+            name += classify_indicator(path)
         is_dir = os.path.isdir(path)
-        
-        display_name = c("1;34", basename, use_color) if is_dir else basename
-        output = f"{icon + ' ' if icon else ''}{display_name}"
-        
-        if (i + 1) % num_cols == 0:
-            print(output)
-        else:
-            print(output.ljust(col_width), end="")
-    
-    # Final newline if needed
-    if len(paths) % num_cols != 0:
-        print()
+        plain = f"{icon + ' ' if icon else ''}{name}"
+        coloured = f"{icon + ' ' if icon else ''}{c('1;34', name, use_color) if is_dir else name}"
+        cells.append((plain, coloured))
+
+    col_width = max(len(p) for p, _ in cells) + 2
+    num_cols = max(1, terminal_width // col_width)
+    num_rows = -(-len(cells) // num_cols)  # ceiling division
+
+    def pad(idx):
+        plain, coloured = cells[idx]
+        return coloured + " " * max(0, col_width - len(plain))
+
+    if getattr(args, "across", False):
+        # Row-major: entries run left to right.
+        for r in range(num_rows):
+            row = [pad(i) for i in range(r * num_cols, min((r + 1) * num_cols, len(cells)))]
+            print("".join(row).rstrip())
+    else:
+        # Column-major (eza default): entries run top to bottom.
+        for r in range(num_rows):
+            row = []
+            for col in range(num_cols):
+                idx = col * num_rows + r
+                if idx < len(cells):
+                    row.append(pad(idx))
+            if row:
+                print("".join(row).rstrip())
 
 # ---------------------------------------------------------------------------
 # Oneline Rendering (from eza-0.23.5)
 # ---------------------------------------------------------------------------
 def render_oneline(paths, use_color, args):
     """Render one entry per line (simple list)."""
+    classify = getattr(args, "classify", False)
+    # --oneline is a list format that gets piped, so names are left unquoted
+    # unless quoting was asked for explicitly elsewhere; --no-quotes is a no-op
+    # here by design (see --no-quotes help text).
     for path in paths:
         icon = get_file_icon(path, os.path.isdir(path)) if args.icons else ""
         is_dir = os.path.isdir(path)
-        
+        shown = display_path(path, args) + (classify_indicator(path) if classify else "")
+
         if args.long:
             # Simple long format
             try:
-                st = os.lstat(path)
+                st = get_file_stat(path, getattr(args, "dereference", False))
                 size_str = format_size(st.st_size, not args.metric_units)
-                display_name = c("1;34", path, use_color) if is_dir else c("1;32", path, use_color)
+                display_name = c("1;34", shown, use_color) if is_dir else c("1;32", shown, use_color)
                 print(f"{icon + ' ' if icon else ''}{display_name:<60} {c('33', size_str, use_color)}")
             except OSError:
-                print(path)
+                print(shown)
         else:
-            display_name = c("1;34", path, use_color) if is_dir else path
+            display_name = c("1;34", shown, use_color) if is_dir else shown
             if args.null:
                 print(f"{icon + ' ' if icon else ''}{display_name}", end="\0")
             else:
@@ -1194,6 +1915,56 @@ def apply_replacement_preview(line_text, replacement_pattern, pattern=None, is_r
 # ---------------------------------------------------------------------------
 # Standard Ranked Rendering Engine
 # ---------------------------------------------------------------------------
+def cap_lines_data(lines_data, args):
+    """Bound a file's context output to --max MATCH lines, keeping the context
+    around each one.
+
+    `--max` is documented as "content samples per file" and has always capped
+    the no-context `samples` list, but the context path rendered every entry in
+    `lines_data`. One kernel file with 36 hits therefore emitted 36 blocks and
+    a single search returned 35 KB. Tool output is re-sent on every later turn,
+    so that is a recurring bill, and the cap has to apply where the volume
+    actually is. --passthru opts out by definition: it asked for whole files.
+    """
+    cap = getattr(args, "max", 0) or 0
+    if cap <= 0 or getattr(args, "passthru", False):
+        return lines_data, 0
+    kept, matches_seen = [], 0
+    for entry in lines_data:
+        is_match = entry[2]
+        if is_match:
+            matches_seen += 1
+            if matches_seen > cap:
+                break
+        kept.append(entry)
+    total = sum(1 for e in lines_data if e[2])
+    return kept, max(0, total - cap) if total > cap else 0
+
+def prep_line_text(text, args):
+    """--trim strips leading whitespace; --max-columns truncates long lines,
+    suppressing them entirely unless --max-columns-preview is given
+    (ripgrep-15.2.0 crates/core/flags/defs.rs MaxColumns)."""
+    if getattr(args, "trim", False):
+        text = text.lstrip()
+    limit = getattr(args, "max_columns", 0) or 0
+    if limit and len(text) > limit:
+        if getattr(args, "max_columns_preview", False):
+            return text[:limit] + " [… omitted end of long line]"
+        return f"[Omitted long line with {len(text)} chars]"
+    return text
+
+def line_prefix(path, lineno, hit_data, args, in_heading):
+    """Optional per-line prefixes: -H/--with-filename forces the path even in
+    heading mode, -b/--byte-offset prepends the match's absolute byte offset."""
+    parts = []
+    if getattr(args, "with_filename", False) and in_heading and not getattr(args, "no_filename", False):
+        parts.append(path)
+    if getattr(args, "byte_offset", False):
+        off = (hit_data.get("offsets") or {}).get(lineno)
+        if off is not None:
+            parts.append(str(off))
+    return ":".join(parts) + ":" if parts else ""
+
 def render(fused, name_scores, content_hits, git_cache, args, use_color, query_pattern=None):
     if not fused:
         print("no matches.", file=sys.stderr)
@@ -1202,12 +1973,15 @@ def render(fused, name_scores, content_hits, git_cache, args, use_color, query_p
     # Extract paths
     paths = [p for p, _, _ in fused]
     
-    # Apply file/directory filtering
+    # Apply file/directory filtering. --show-symlinks keeps symlinks visible
+    # even when -D/--only-files would otherwise filter them out (eza's
+    # --show-symlinks / --no-symlinks pair).
+    keep_links = getattr(args, "show_symlinks", False)
     if args.only_dirs:
-        paths = [p for p in paths if os.path.isdir(p)]
+        paths = [p for p in paths if os.path.isdir(p) or (keep_links and os.path.islink(p))]
     elif args.only_files:
-        paths = [p for p in paths if os.path.isfile(p)]
-    
+        paths = [p for p in paths if os.path.isfile(p) or (keep_links and os.path.islink(p))]
+
     # Apply symlink filtering
     if args.no_symlinks:
         paths = [p for p in paths if not os.path.islink(p)]
@@ -1307,10 +2081,12 @@ def render(fused, name_scores, content_hits, git_cache, args, use_color, query_p
             loc_res = classify_file_loc(path)
             if loc_res:
                 _, lc = loc_res
-                loc_badge = f" {c('90', f'(LOC: {lc.code} code, {lc.comments} com)', use_color)}"
+                badge = format_loc_badge(lc, args.loc if isinstance(args.loc, str) else "both")
+                loc_badge = f" {c('90', badge, use_color)}"
 
-        path_display = make_hyperlink(path, 0, path, args.hyperlink, args.hyperlink_format)
-        header = f"{c('90', f'{score:6.4f}', use_color)}  [{tag}]  {icon + ' ' if icon else ''}{c('1;32', path_display, use_color)}{git_badge}{loc_badge}"
+        shown_name = display_path(path, args) + (classify_indicator(path) if getattr(args, "classify", False) else "")
+        path_display = make_hyperlink(path, 0, shown_name, args.hyperlink, args.hyperlink_format)
+        header = f"{c('90', f'{score:6.4f}', use_color)}  [{tag}]  {icon + ' ' if icon else ''}{cc('path', path_display, use_color)}{git_badge}{loc_badge}"
 
         if args.files_only:
             if args.null:
@@ -1329,7 +2105,8 @@ def render(fused, name_scores, content_hits, git_cache, args, use_color, query_p
         if args.no_heading:
             # Prefix each line with filename
             hit_data = content_hits.get(path, {})
-            if args.context > 0 or args.after_context > 0 or args.before_context > 0:
+            if (args.context > 0 or args.after_context > 0 or args.before_context > 0
+                    or args.passthru):
                 lines_data = hit_data.get("lines_data", [])
                 for line_info in lines_data:
                     if len(line_info) == 4:  # Has column info
@@ -1339,17 +2116,21 @@ def render(fused, name_scores, content_hits, git_cache, args, use_color, query_p
                         col = 0
                     
                     sep = match_sep if is_match else ctx_sep
+                    # --no-filename drops the path *and* the separator that
+                    # would otherwise be left dangling at the start of the line.
+                    head = "" if getattr(args, "no_filename", False) else f"{out_path}{sep}"
                     if args.column and col > 0 and not args.no_line_number:
-                        lineno_disp = f"{out_path}{sep}{lineno}{sep}{col}{sep}"
+                        lineno_disp = f"{head}{lineno}{sep}{col}{sep}"
                     elif not args.no_line_number:
-                        lineno_disp = f"{out_path}{sep}{lineno}{sep}"
+                        lineno_disp = f"{head}{lineno}{sep}"
                     else:
-                        lineno_disp = f"{out_path}{sep}"
-                    
+                        lineno_disp = head
+
                     if args.replace and is_match:
                         # Apply replacement preview
                         text = apply_replacement_preview(text, args.replace, query_pattern, args.regex)
-                    print(f"{lineno_disp} {text}")
+                    off = line_prefix(path, lineno, hit_data, args, in_heading=False)
+                    print(f"{off}{lineno_disp} {prep_line_text(text, args)}")
             else:
                 for sample in hit_data.get("samples", []):
                     if len(sample) == 3:  # Has column info
@@ -1358,24 +2139,27 @@ def render(fused, name_scores, content_hits, git_cache, args, use_color, query_p
                         lineno, text = sample
                         col = 0
                     
+                    head = "" if getattr(args, "no_filename", False) else f"{out_path}{match_sep}"
                     if args.column and col > 0 and not args.no_line_number:
-                        lineno_disp = f"{out_path}{match_sep}{lineno}{match_sep}{col}{match_sep}"
+                        lineno_disp = f"{head}{lineno}{match_sep}{col}{match_sep}"
                     elif not args.no_line_number:
-                        lineno_disp = f"{out_path}{match_sep}{lineno}{match_sep}"
+                        lineno_disp = f"{head}{lineno}{match_sep}"
                     else:
-                        lineno_disp = f"{out_path}{match_sep}"
-                    
+                        lineno_disp = head
+
                     if args.replace:
                         text = apply_replacement_preview(text, args.replace, query_pattern, args.regex)
-                    print(f"{lineno_disp} {text}")
+                    off = line_prefix(path, lineno, hit_data, args, in_heading=False)
+                    print(f"{off}{lineno_disp} {prep_line_text(text, args)}")
         else:
             # Default: heading mode
             print(header)
             if not args.names:
                 hit_data = content_hits.get(path, {})
                 # If context windows exist, print formatted blocks
-                if args.context > 0 or args.after_context > 0 or args.before_context > 0:
-                    lines_data = hit_data.get("lines_data", [])
+                if (args.context > 0 or args.after_context > 0 or args.before_context > 0
+                        or args.passthru):
+                    lines_data, omitted = cap_lines_data(hit_data.get("lines_data", []), args)
                     last_line = None
                     for line_info in lines_data:
                         if len(line_info) == 4:  # Has column info
@@ -1396,10 +2180,16 @@ def render(fused, name_scores, content_hits, git_cache, args, use_color, query_p
                         
                         if args.replace and is_match:
                             text = apply_replacement_preview(text, args.replace, query_pattern, args.regex)
+                        off = line_prefix(path, lineno, hit_data, args, in_heading=True)
+                        text = prep_line_text(text, args)
                         if is_match:
-                            print(f"    {c('1;33', lineno_disp, use_color)} {text}")
+                            print(f"    {off}{cc('line', lineno_disp, use_color)} {text}")
                         else:
-                            print(f"    {c('90', lineno_disp, use_color)} {text}")
+                            print(f"    {off}{c('90', lineno_disp, use_color)} {text}")
+                    if omitted:
+                        # Say what was dropped. A silently capped result reads
+                        # as the whole answer.
+                        print(f"    {c('90', f'… {omitted} more match(es) in this file (raise --max)', use_color)}")
                 else:
                     for sample in hit_data.get("samples", []):
                         if len(sample) == 3:  # Has column info
@@ -1411,7 +2201,8 @@ def render(fused, name_scores, content_hits, git_cache, args, use_color, query_p
                         
                         if args.replace:
                             text = apply_replacement_preview(text, args.replace, query_pattern, args.regex)
-                        print(f"    {c('90', lineno_disp, use_color)} {text}")
+                        off = line_prefix(path, lineno, hit_data, args, in_heading=True)
+                        print(f"    {off}{c('90', lineno_disp, use_color)} {prep_line_text(text, args)}")
 
     if args.count:
         print(f"\n--- {len(fused)} file(s) matched"
@@ -1429,28 +2220,70 @@ def build_loose_regex(snippet):
 # ---------------------------------------------------------------------------
 # File Sorting
 # ---------------------------------------------------------------------------
+# eza-0.23.5 src/fs/filter.rs SortField vocabulary. Capitalised variants sort
+# case-sensitively (uppercase first); a leading dot ignores a leading dot in the
+# name. `age`/`old` are oldest-first, `newest` is newest-first.
+SORT_FIELDS = [
+    "name", "Name", ".name", ".Name", "size", "ext", "Ext", "type", "inode",
+    "date", "time", "modified", "changed", "accessed", "created",
+    "age", "old", "newest", "path", "none",
+]
+
 def sort_files(files, sort_by, reverse=False, dirs_first=False, dirs_last=False):
     """Sort files by specified field with optional directory grouping."""
     if not sort_by or sort_by == "none":
         files_list = list(files)
     else:
+        # age/old = oldest first, newest = newest first: both are mtime with a
+        # baked-in direction, applied on top of any explicit --reverse.
+        invert = sort_by == "newest"
+        field = sort_by
+
         def get_sort_key(path):
+            base = os.path.basename(path)
             try:
-                st = os.stat(path)
-                if sort_by == "modified":
-                    return st.st_mtime
-                elif sort_by == "accessed":
-                    return st.st_atime
-                elif sort_by == "created":
-                    return st.st_ctime if hasattr(st, 'st_ctime') else st.st_mtime
-                elif sort_by == "path":
-                    return path
-                else:
-                    return path
+                st = os.lstat(path)
             except OSError:
-                return 0 if sort_by != "path" else path
-        
-        files_list = sorted(files, key=get_sort_key, reverse=reverse)
+                st = None
+
+            def t(attr, default=0.0):
+                return getattr(st, attr, default) if st else default
+
+            if field in ("modified", "date", "time", "age", "old", "newest"):
+                return t("st_mtime")
+            if field == "accessed":
+                return t("st_atime")
+            if field == "changed":
+                return t("st_ctime")
+            if field == "created":
+                return getattr(st, "st_birthtime", t("st_ctime")) if st else 0.0
+            if field == "size":
+                return t("st_size")
+            if field == "inode":
+                return t("st_ino")
+            if field == "type":
+                if not st:
+                    return (9, base.lower())
+                mode = st.st_mode
+                rank = (0 if stat.S_ISDIR(mode) else
+                        1 if stat.S_ISLNK(mode) else
+                        2 if stat.S_ISREG(mode) else 3)
+                return (rank, base.lower())
+            if field == "ext":
+                return (os.path.splitext(base)[1].lower(), base.lower())
+            if field == "Ext":
+                return (os.path.splitext(base)[1], base)
+            if field == "Name":
+                return base
+            if field == ".name":
+                return base.lstrip(".").lower()
+            if field == ".Name":
+                return base.lstrip(".")
+            if field == "path":
+                return path
+            return base.lower()  # "name"
+
+        files_list = sorted(files, key=get_sort_key, reverse=(reverse != invert))
     
     # Apply directory grouping
     if dirs_first:
@@ -1491,10 +2324,10 @@ def build_parser():
     p.add_argument("paths", nargs="*", help="roots to search (default: cwd, or a preset)")
 
     # presets
-    p.add_argument("--brain", action="store_true", help="search ~/Documents/SECOND.BRAIN + Chroma semantic seam")
-    p.add_argument("--work", action="store_true", help="search ~/Documents/FIREFOX.WORK toolkit")
-    p.add_argument("--src", action="store_true", help="search ~/firefox-main source tree")
-    p.add_argument("--all", action="store_true", help="search brain + work + src in one shot")
+    p.add_argument("--brain", action="store_true", help="search the configured 'brain' preset root (+ Chroma semantic seam if configured)")
+    p.add_argument("--work", action="store_true", help="search the configured 'work' preset root")
+    p.add_argument("--src", action="store_true", help="search the configured 'src' preset root")
+    p.add_argument("--all", action="store_true", help="search all configured presets in one shot (see ~/.config/pfind/presets.json)")
 
     # search modes
     p.add_argument("-r", "--regex", action="store_true", help="treat query as a regex")
@@ -1508,6 +2341,16 @@ def build_parser():
     p.add_argument("--fuzzy", action="store_true", help="typo/partial-tolerant name matching")
     p.add_argument("-v", "--invert-match", action="store_true", help="select non-matching lines")
     p.add_argument("--pcre2", action="store_true", help="enable PCRE2 regex engine")
+    p.add_argument("--engine", choices=["default", "pcre2", "auto"], default="default",
+                   help="regex engine selector (default|pcre2|auto)")
+    p.add_argument("-U", "--multiline", action="store_true", help="allow matches to span line boundaries")
+    p.add_argument("--multiline-dotall", action="store_true", help="with --multiline, let . match newlines")
+    p.add_argument("--line-regexp", action="store_true", help="match only whole lines")
+    p.add_argument("-E", "--encoding", type=str, default=None, help="force text encoding (utf-16, latin1, ...)")
+    p.add_argument("--no-unicode", action="store_true", help="disable Unicode-aware matching (ASCII only)")
+    p.add_argument("--crlf", action="store_true", help="treat CRLF as the line terminator")
+    p.add_argument("--null-data", action="store_true", help="use NUL as the line terminator")
+    p.add_argument("--stop-on-nonmatch", action="store_true", help="stop searching a file after a non-match past a match")
 
     # context & sinks
     p.add_argument("-C", "--context", type=int, default=0, help="show NUM lines before and after match")
@@ -1524,6 +2367,18 @@ def build_parser():
     p.add_argument("-c", "--count-lines", action="store_true", help="count matching lines per file")
     p.add_argument("--count-matches", action="store_true", help="count individual matches (not lines)")
     p.add_argument("--include-zero", action="store_true", help="with --count, show files with 0 matches too")
+    p.add_argument("-M", "--max-columns", type=int, default=0, help="omit lines longer than NUM characters")
+    p.add_argument("--max-columns-preview", action="store_true", help="with --max-columns, show a truncated preview instead")
+    p.add_argument("-b", "--byte-offset", action="store_true", help="print the absolute byte offset of each line")
+    p.add_argument("-H", "--with-filename", action="store_true", help="print the file path on every output line")
+    p.add_argument("--no-filename", action="store_true", help="never print the file path on output lines")
+    p.add_argument("--trim", action="store_true", help="strip leading whitespace from output lines")
+    p.add_argument("--passthru", "--passthrough", action="store_true", dest="passthru",
+                   help="print every line of matching files, not just matches")
+    p.add_argument("--colors", action="append", dest="color_specs", metavar="SPEC", default=[],
+                   help="per-component colour, e.g. 'match:fg:red' or 'path:fg:0x00AAFF' (repeatable)")
+    p.add_argument("--hostname-bin", type=str, default=None, metavar="CMD",
+                   help="command whose output supplies the hostname in OSC 8 hyperlinks")
 
     # scope & types
     p.add_argument("-t", "--type", action="append", dest="types", help="filter by language type (rust, py, c, etc.)")
@@ -1536,6 +2391,12 @@ def build_parser():
     p.add_argument("--ext", nargs="+", metavar="EXT", help="only these extensions (.py .sh ...)")
     p.add_argument("--exclude", nargs="+", metavar="GLOB", default=[], help="extra excludes")
     p.add_argument("-g", "--glob", action="append", dest="globs", default=[], help="include/exclude glob (repeatable)")
+    p.add_argument("--iglob", action="append", dest="iglobs", default=[], metavar="GLOB",
+                   help="case-insensitive include/exclude glob (repeatable)")
+    p.add_argument("--glob-case-insensitive", action="store_true", help="treat all -g globs as case-insensitive")
+    p.add_argument("--ignore-file", action="append", dest="ignore_files", default=[], metavar="PATH",
+                   help="load additional ignore rules from PATH (repeatable)")
+    p.add_argument("--ignore-file-case-insensitive", action="store_true", help="match --ignore-file rules case-insensitively")
     p.add_argument("-e", "--regexp", action="append", dest="patterns", default=[], help="additional pattern (repeatable, OR logic)")
     p.add_argument("-f", "--pattern-file", type=str, help="read patterns from file (one per line)")
     p.add_argument("-z", "--search-zip", action="store_true", help="search inside compressed archives (.gz, .zip, etc.)")
@@ -1547,10 +2408,21 @@ def build_parser():
     p.add_argument("--no-ignore-global", action="store_true", help="don't respect ~/.config/git/ignore")
     p.add_argument("--no-ignore-parent", action="store_true", help="don't ascend for ignore files")
     p.add_argument("--no-ignore-vcs", action="store_true", help="ignore .gitignore but keep .ignore")
+    p.add_argument("--no-ignore-exclude", action="store_true", help="don't respect .git/info/exclude")
+    p.add_argument("--no-ignore-messages", action="store_true", help="suppress errors about malformed ignore files")
+    p.add_argument("--no-require-git", action="store_true", help="respect git ignore rules outside a git repository")
+    p.add_argument("--git-ignore", action="store_true", help="honour .gitignore when listing files")
     p.add_argument("-u", "--unrestricted", action="count", default=0, help="-u skip ignores; -uu +hidden; -uuu +binary")
     p.add_argument("-d", "--max-depth", type=int, default=None, help="max directory descent depth")
     p.add_argument("--max-filesize", type=str, help="skip files larger than NUM (bytes, K, M, G)")
     p.add_argument("--one-file-system", action="store_true", help="don't cross filesystem boundaries")
+    p.add_argument("--mmap", action="store_true", help="force memory-mapped I/O where possible")
+    p.add_argument("--no-mmap", action="store_true", help="never use memory-mapped I/O")
+    p.add_argument("--block-buffered", action="store_true", help="force block buffering on output")
+    p.add_argument("--line-buffered", action="store_true", help="force line buffering on output")
+    p.add_argument("--dfa-size-limit", type=str, default=None, metavar="NUM", help="cap the regex DFA cache size")
+    p.add_argument("--regex-size-limit", type=str, default=None, metavar="NUM", help="cap the compiled regex size")
+    p.add_argument("--no-config", action="store_true", help="ignore RIPGREP_CONFIG_PATH")
 
     # presentation & eza views
     p.add_argument("-l", "--long", action="store_true", help="show detailed file metadata table")
@@ -1559,18 +2431,30 @@ def build_parser():
     p.add_argument("-R", "--recurse", action="store_true", help="flat recursive listing (no tree connectors)")
     p.add_argument("-G", "--grid", action="store_true", help="multi-column grid layout")
     p.add_argument("-1", "--oneline", action="store_true", help="one entry per line")
-    p.add_argument("--loc", action="store_true", help="calculate comment-aware lines of code")
-    p.add_argument("--code", action="store_true", help="output aggregated code/comment/blank summary table")
+    p.add_argument("--across", action="store_true", help="fill the grid across rows rather than down columns")
+    p.add_argument("--width", type=int, default=None, metavar="COLS", help="override the detected terminal width")
+    p.add_argument("--loc", nargs="?", const="both", choices=["lines", "percent", "both"], default=None,
+                   help="comment-aware lines of code (=lines|percent|both, default both)")
+    p.add_argument("--code", nargs="?", const="both", choices=["lines", "percent", "both"], default=None,
+                   help="aggregated code/comment/blank summary table (=lines|percent|both)")
     p.add_argument("--git", action="store_true", default=True, help="display Git status flags (default: on)")
     p.add_argument("--no-git", action="store_true", help="suppress all git columns")
+    p.add_argument("--git-repos", action="store_true", help="show branch and dirty/clean state for repository directories")
+    p.add_argument("--git-repos-no-status", action="store_true", help="show repository branch only (skips the status scan)")
     p.add_argument("--git-dirty", action="store_true", help="filter/boost modified Git files")
     p.add_argument("--dirty-boost", action="store_true", help="boost uncommitted Git files in RRF ranking")
     p.add_argument("--recency-boost", action="store_true", help="boost recently modified files in RRF ranking")
     p.add_argument("--color-scale", action="store_true", help="highlight size and recency with adaptive color scales")
     p.add_argument("--color-scale-mode", choices=["fixed", "gradient"], default="fixed", help="color scale mode (fixed|gradient)")
     p.add_argument("--total-size", action="store_true", help="calculate directory size as sum of contents")
-    p.add_argument("--time", choices=["modified", "accessed", "created"], default="modified", help="timestamp type")
-    p.add_argument("--time-style", choices=["relative", "iso", "default"], default="relative", help="timestamp format")
+    p.add_argument("--time", choices=["modified", "accessed", "changed", "created"], default="modified",
+                   help="timestamp field shown in --long")
+    p.add_argument("--changed", action="store_true", help="show the changed (ctime) timestamp; same as --time changed")
+    p.add_argument("--accessed", action="store_true", help="show the accessed timestamp; same as --time accessed")
+    p.add_argument("--modified", action="store_true", help="show the modified timestamp (default)")
+    p.add_argument("--created", action="store_true", help="show the created timestamp; same as --time created")
+    p.add_argument("--time-style", type=str, default="relative", metavar="STYLE",
+                   help="timestamp format: default|iso|long-iso|full-iso|relative|+FORMAT (strftime)")
     p.add_argument("--octal-permissions", action="store_true", help="show numeric octal permissions")
     p.add_argument("--blocks", action="store_true", help="show allocated filesystem blocks")
     p.add_argument("--inode", action="store_true", help="show inode number")
@@ -1579,6 +2463,26 @@ def build_parser():
     p.add_argument("--binary-units", action="store_true", help="use 1024-based binary units (KiB, MiB) - default")
     p.add_argument("--bytes", action="store_true", help="show raw byte count (no unit prefix)")
     p.add_argument("--header", action="store_true", help="show column header row")
+    p.add_argument("--no-permissions", action="store_true", help="suppress the permissions column")
+    p.add_argument("--no-filesize", action="store_true", help="suppress the file size column")
+    p.add_argument("--no-user", action="store_true", help="suppress the user column")
+    p.add_argument("--no-time", action="store_true", help="suppress the timestamp column")
+    # eza spells this -g, but -g is ripgrep's --glob and pfind keeps ripgrep's
+    # meaning for the short flag; --group is long-form only here.
+    p.add_argument("--group", action="store_true", help="show the group column (shown by default in --long)")
+    p.add_argument("--smart-group", action="store_true", help="show the group only when it differs from the owner")
+    p.add_argument("--numeric", action="store_true", help="show user and group as numeric UID/GID")
+    p.add_argument("--extended", action="store_true", help="list extended attributes (xattrs) and their sizes")
+    p.add_argument("--flags", action="store_true", help="show file flags (BSD st_flags; ext attributes via lsattr on Linux)")
+    p.add_argument("--mounts", action="store_true", help="show device and filesystem type for mount points")
+    p.add_argument("--dereference", action="store_true", help="show the symlink target's metadata, not the link's")
+    p.add_argument("--classify", action="store_true", help="append a type indicator (/ * @ | =) to names")
+    p.add_argument("--absolute", nargs="?", const="on", choices=["on", "off", "follow"], default="off",
+                   help="print absolute paths (on|off|follow; follow resolves symlinks)")
+    p.add_argument("--no-quotes", action="store_true", help="don't quote names containing spaces or shell characters")
+    p.add_argument("--short-nix", action="store_true", help="abbreviate Nix store hashes in paths")
+    p.add_argument("--stdin", action="store_true", help="read the list of paths from stdin, one per line")
+    p.add_argument("--treat-dirs-as-files", action="store_true", help="list directories as entries without descending")
     p.add_argument("--icons", action="store_true", help="display Nerd Font file icons")
     p.add_argument("--hyperlink", action="store_true", help="emit OSC 8 clickable terminal hyperlinks")
     p.add_argument("--hyperlink-format", type=str, default="file", choices=["file", "vscode", "grep+"], 
@@ -1616,10 +2520,10 @@ def build_parser():
     p.add_argument("--vimgrep", action="store_true", help="file:line:col:match format (vim :cgetfile)")
     p.add_argument("-p", "--pretty", action="store_true", help="force --color=always --heading --line-number")
     p.add_argument("-0", "--null", action="store_true", help="NUL-terminate file paths")
-    p.add_argument("--sort", type=str, choices=["path", "modified", "accessed", "created", "none"], 
-                   help="sort results by field")
-    p.add_argument("--sortr", type=str, choices=["path", "modified", "accessed", "created"], 
-                   help="reverse sort by field")
+    p.add_argument("--sort", type=str, choices=SORT_FIELDS, metavar="FIELD",
+                   help="sort by: " + " | ".join(SORT_FIELDS))
+    p.add_argument("--sortr", type=str, choices=SORT_FIELDS, metavar="FIELD",
+                   help="reverse sort by the same field vocabulary as --sort")
     p.add_argument("--color", type=str, choices=["never", "auto", "always", "ansi"], default="auto",
                    help="color output (never|auto|always|ansi)")
     p.add_argument("--workers", type=int, default=LOGICAL_CPUS, help=f"threads (default {LOGICAL_CPUS})")
@@ -1659,7 +2563,61 @@ def main():
     if args.type_list:
         print_type_list()
         return 0
-    
+
+    # --colors / --hostname-bin affect every later render, so resolve them first
+    parse_color_specs(args.color_specs)
+    if args.hostname_bin:
+        resolve_hostname_bin(args.hostname_bin)
+
+    # eza's standalone timestamp-field flags are aliases for --time FIELD;
+    # last one on the command line does not win here, most specific does.
+    if args.changed:
+        args.time = "changed"
+    elif args.accessed:
+        args.time = "accessed"
+    elif args.created:
+        args.time = "created"
+    elif args.modified:
+        args.time = "modified"
+
+    # --engine is the general form of --pcre2; either one enables PCRE2.
+    if args.engine == "pcre2":
+        args.pcre2 = True
+    if args.pcre2 and args.engine == "default":
+        args.engine = "pcre2"
+
+    # --binary-units is the default; --metric-units is the only real switch.
+    if args.binary_units and args.metric_units:
+        print("pfind: --binary-units and --metric-units conflict; using binary (1024)", file=sys.stderr)
+        args.metric_units = False
+
+    if args.mmap and args.no_mmap:
+        print("pfind: --mmap and --no-mmap conflict; letting ripgrep choose", file=sys.stderr)
+        args.mmap = args.no_mmap = False
+
+    # --stdin: the path list comes from stdin rather than the command line.
+    if args.stdin:
+        stdin_paths = [line.rstrip("\n") for line in sys.stdin if line.strip()]
+        if not stdin_paths:
+            print("pfind: --stdin given but no paths on stdin", file=sys.stderr)
+            return 1
+        args.paths = list(args.paths) + stdin_paths
+
+    if not HAVE_RG:
+        # Flags that only exist as ripgrep passthrough have no pure-Python
+        # equivalent. Say so rather than appearing to honour them.
+        unsupported = [n for n, v in (
+            ("--pre", args.pre), ("--pre-glob", args.pre_glob), ("--pcre2", args.pcre2),
+            ("--mmap", args.mmap), ("--no-mmap", args.no_mmap),
+            ("--dfa-size-limit", args.dfa_size_limit), ("--regex-size-limit", args.regex_size_limit),
+            ("--null-data", args.null_data), ("--no-unicode", args.no_unicode),
+            ("--block-buffered", args.block_buffered), ("--line-buffered", args.line_buffered),
+            ("--no-config", args.no_config), ("--ignore-file", args.ignore_files),
+        ) if v]
+        if unsupported and not args.no_messages:
+            print(f"pfind: ripgrep not installed; ignoring {', '.join(unsupported)} "
+                  f"(no pure-Python equivalent)", file=sys.stderr)
+
     # Handle color mode
     if args.color == "never" or args.no_color:
         use_color = False
@@ -1686,6 +2644,10 @@ def main():
     if args.unrestricted >= 3:
         args.text = True
 
+    # --git-repos-no-status implies the repo column, minus the status scan
+    if args.git_repos_no_status:
+        args.git_repos = True
+
     presets = [name for name in ("brain", "work", "src") if getattr(args, name)]
     if args.all:
         presets = ["brain", "work", "src"]
@@ -1697,12 +2659,16 @@ def main():
             path_list.insert(0, args.query)
         roots = resolve_roots(path_list, presets)
         type_globs = resolve_type_globs(args.types, args.types_not)
-        all_files = (rg_list_files(roots, args.ext, args.exclude, type_globs, args.hidden, args.no_ignore, args.workers, args.max_depth, globs=args.globs)
-                     if HAVE_RG else py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, globs=args.globs))
+        all_files = (rg_list_files(roots, args.ext, args.exclude, type_globs, args.hidden, args.no_ignore, args.workers, args.max_depth, globs=args.globs, opts=args)
+                     if HAVE_RG else py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, globs=args.globs, opts=args))
         for r in roots:
             if os.path.isfile(r) and str(r) not in all_files:
                 all_files.append(str(r))
-        render_code_summary_table(all_files, use_color)
+        if args.git_ignore and HAVE_RG:
+            pass  # rg already applied .gitignore during enumeration
+        elif args.git_ignore:
+            all_files = git_ignored_filter(all_files)
+        render_code_summary_table(all_files, use_color, args.code)
         return 0
     
     # --files mode: list files that would be searched (no search)
@@ -1712,18 +2678,30 @@ def main():
             path_list.insert(0, args.query)
         roots = resolve_roots(path_list, presets)
         type_globs = resolve_type_globs(args.types, args.types_not)
-        all_files = (rg_list_files(roots, args.ext, args.exclude, type_globs, args.hidden, args.no_ignore, args.workers, args.max_depth, globs=args.globs)
-                     if HAVE_RG else py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, globs=args.globs))
+        all_files = (rg_list_files(roots, args.ext, args.exclude, type_globs, args.hidden, args.no_ignore, args.workers, args.max_depth, globs=args.globs, opts=args)
+                     if HAVE_RG else py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, globs=args.globs, opts=args))
         for r in roots:
             if os.path.isfile(r) and str(r) not in all_files:
                 all_files.append(str(r))
-        for f in all_files:
+        # --limit applies here as everywhere else. This branch printed every
+        # path unconditionally, which on a kernel-sized tree is a 14 MB dump;
+        # a limit that only binds some modes is not a limit. The cut is
+        # announced — silence and truncation must never look alike.
+        shown = all_files[:args.limit] if args.limit else all_files
+        for f in shown:
             print(f)
+        if len(all_files) > len(shown):
+            print(f"… and {len(all_files) - len(shown)} more file(s) not shown (raise --limit)")
         return 0
 
     # Exploratory Mode (zero query or explicit directory target with tree/long flags)
     is_exploratory = (not args.query or args.query == ".")
-    if not is_exploratory and (args.tree or args.long) and not args.paths:
+    # A layout flag plus a single existing path means "list that path", not
+    # "search for a file named like that path". --grid/--oneline/--recurse are
+    # included here so the grid options (--across, --width) are reachable on a
+    # named directory, not only on the implicit cwd.
+    if not is_exploratory and (args.tree or args.long or args.grid or args.oneline
+                               or args.recurse or args.treat_dirs_as_files) and not args.paths:
         if os.path.exists(args.query):
             args.paths = [args.query]
             args.query = None
@@ -1733,22 +2711,33 @@ def main():
         roots = resolve_roots(args.paths, presets)
         type_globs = resolve_type_globs(args.types, args.types_not)
         git_cache = GitStatusCache(roots) if args.git else None
+        if args.treat_dirs_as_files:
+            # eza --treat-dirs-as-files: the named directories are the entries;
+            # nothing is descended into.
+            all_files = [str(r) for r in roots]
+            limit = args.limit if args.limit else 100
+            render_long_table(all_files[:limit], {}, git_cache, args, use_color)
+            return 0
         if args.only_dirs:
-            all_files = py_fallback_files(roots, args.ext, args.exclude, type_globs, args.max_depth, include_dirs=True, include_hidden=args.hidden or args.almost_all, globs=args.globs)
+            all_files = py_fallback_files(roots, args.ext, args.exclude, type_globs, args.max_depth, include_dirs=True, include_hidden=args.hidden or args.almost_all, globs=args.globs, opts=args)
             all_files = [f for f in all_files if os.path.isdir(f)]
         else:
-            all_files = (rg_list_files(roots, args.ext, args.exclude, type_globs, args.hidden, args.no_ignore, args.workers, args.max_depth, globs=args.globs)
-                         if HAVE_RG else py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, include_hidden=args.hidden or args.almost_all, globs=args.globs))
+            all_files = (rg_list_files(roots, args.ext, args.exclude, type_globs, args.hidden, args.no_ignore, args.workers, args.max_depth, globs=args.globs, opts=args)
+                         if HAVE_RG else py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, include_hidden=args.hidden or args.almost_all, globs=args.globs, opts=args))
             for r in roots:
                 if os.path.isfile(r) and str(r) not in all_files:
                     all_files.append(str(r))
         
         # Apply filtering
         if args.only_files:
-            all_files = [f for f in all_files if os.path.isfile(f)]
-        
+            all_files = [f for f in all_files
+                         if os.path.isfile(f) or (args.show_symlinks and os.path.islink(f))]
+
         if args.no_symlinks:
             all_files = [f for f in all_files if not os.path.islink(f)]
+
+        if args.git_ignore and not HAVE_RG:
+            all_files = git_ignored_filter(all_files)
         
         if args.almost_all:
             # Include dotfiles but not . and ..
@@ -1841,13 +2830,17 @@ def main():
         pattern = query
         use_regex = args.regex
         use_fixed = args.fixed_strings or (not args.regex)
-        multiline = False
+        # -U/--multiline is the explicit form of what -x/--loose enable implicitly
+        multiline = args.multiline or args.multiline_dotall
 
     # 1. Name search
     name_ranked, name_scores = [], {}
     if do_names:
-        files = (rg_list_files(roots, args.ext, args.exclude, type_globs, args.hidden, args.no_ignore, args.workers, args.max_depth, globs=args.globs)
-                 if HAVE_RG else py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, globs=args.globs))
+        files = (rg_list_files(roots, args.ext, args.exclude, type_globs, args.hidden, args.no_ignore, args.workers, args.max_depth, globs=args.globs, opts=args)
+                 if HAVE_RG else py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, globs=args.globs, opts=args))
+        for r in roots:
+            if os.path.isfile(r) and str(r) not in files:
+                files.append(str(r))
         scored = match_names(query, files, use_regex, args.ignore_case, args.fuzzy)
         name_ranked = [fp for fp, _ in scored]
         name_scores = dict(scored)
@@ -1866,14 +2859,21 @@ def main():
                 context_before=ctx_b, context_after=ctx_a, max_depth=args.max_depth,
                 pcre2=args.pcre2, invert_match=args.invert_match, timeout=args.timeout,
                 extract_column=args.column, pre=args.pre, pre_glob=args.pre_glob,
-                globs=args.globs
+                globs=args.globs, opts=args, only_matching=args.only_matching,
+                smart_case=args.smart_case
             )
         else:
-            files = py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, globs=args.globs)
+            files = py_fallback_files(roots, set(args.ext or []), args.exclude, type_globs, args.max_depth, globs=args.globs, opts=args)
+            # os.walk yields nothing for a root that is itself a file, so a
+            # named file would silently return "no matches" without this.
+            for r in roots:
+                if os.path.isfile(r) and str(r) not in files:
+                    files.append(str(r))
             content_hits = py_fallback_content(
                 pattern, files, use_regex, args.ignore_case, args.case_sensitive,
                 args.word_regexp, args.max, search_zip=args.search_zip,
-                context_before=ctx_b, context_after=ctx_a, invert_match=args.invert_match
+                context_before=ctx_b, context_after=ctx_a, invert_match=args.invert_match,
+                opts=args, only_matching=args.only_matching
             )
 
     # Content rank by distinct-term coverage first, then total volume
@@ -1967,3 +2967,9 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
+    except Exception as e:  # noqa: BLE001 — the catch exists to fix the exit code
+        # grep convention: 0 = match, 1 = no match, 2 = error. Python's default
+        # handler exits 1 on any unhandled exception, which made a crash look
+        # exactly like "no matches" to every caller checking the exit code.
+        print(f"pfind: error: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(2)
