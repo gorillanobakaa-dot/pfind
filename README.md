@@ -1,5 +1,16 @@
 # pfind
 
+<!-- WHO-THIS-IS-FOR: managed block, do not edit by hand -->
+
+**Find a file by name, content, meaning, or an exact code snippet. One Python file, no index and no database to build.**
+
+Built for the people every other tool prices out: kids with no credit
+card, 15-year-old laptops, data sold by the megabyte. Free forever, by
+design, not as a trial.
+Why, with the numbers: [PHILOSOPHY.md](https://github.com/gorillanobakaa-dot/Gorilla.Opencode/blob/main/PHILOSOPHY.md)
+
+<!-- /WHO-THIS-IS-FOR -->
+
 **One command to find anything on your machine** — by filename, by what's *inside* the
 files, by *meaning*, or by an exact chunk of code you half-remember — with the results
 **ranked** so the few that matter show up first.
