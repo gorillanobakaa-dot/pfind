@@ -110,7 +110,11 @@ BRAIN_DEFAULT_COLLECTION = "core_memory"  # 91k docs; the firefox/IT working mem
 # Noise this tree is full of. Passed to ripgrep as !globs and used by the fallback.
 EXCLUDE_GLOBS = [
     ".git", ".hg", ".svn", "node_modules", "__pycache__",
-    ".mozbuild", "venv", ".venv", "vector_env", "dist", "build",
+    ".mozbuild", "venv", ".venv", "vector_env",
+    # NOT "build"/"dist": real source lives in folders with those names
+    # (fieldkit/build/, pkg/build/). A blanket skip hid them and pfind said
+    # "not found" with confidence. Build OUTPUT is caught by obj-* below and by
+    # .gitignore, which ripgrep honours; add --exclude build to skip it by hand.
     "obj-*",                       # firefox objdirs: obj-x86_64-pc-linux-gnu
     "chroma_db", "chroma_fx154",   # the big vector stores
     "*.sqlite3", "*.bin", "*.parquet", "*.pyc",
