@@ -25,6 +25,50 @@ exact multi-line snippet matching, and optional semantic search over a local vec
 
 ---
 
+## What it does (Layman Track)
+
+You type a word, part of a file name, or a piece of code you remember, and pfind shows you
+the files that match. The best matches come first, each with the lines that matched, so
+you read a few lines instead of opening hundreds of files.
+
+It works on **Windows and Linux** with the same single file. If you are not sure your
+computer has what it needs, run `pfind --doctor`. It checks your computer, tells you in
+plain words what is missing, and offers to install the one helper that makes it fast
+(`ripgrep`). It installs nothing unless you type `y`. Without that helper pfind still works:
+it gives the same results, only slower.
+
+It never uploads anything, never builds an index, and never changes your files. It only
+finds and shows.
+
+## Technical Definition (Developer Track)
+
+A single Python 3.8+ file, with only the standard library for the core. It runs two search
+engines and requires them to give the same results:
+
+- **ripgrep engine.** `rg --files` and `rg --json`, UTF-8 decoded, honouring `.gitignore`.
+- **Built-in engine.** An `os.walk` search used when ripgrep is missing or when
+  `PFIND_NO_RG=1` is set. It applies the same excludes, hidden-file rule, binary skip,
+  smart-case and multi-line matching.
+
+Results from file names, contents and the optional Chroma semantic layer (`--brain`) are
+fused with weighted Reciprocal Rank Fusion. Content is ranked by the number of distinct
+query terms matched, not by raw hit count.
+
+Snippet mode (`-x`, `--loose`, `--query-file`, or `-` for stdin) matches across line
+breaks, and each break matches both `\n` and `\r\n`.
+
+For agents, `--json` returns `{engine, matched, results: [{path, score, why, hits,
+samples}]}`, and the exit code is `1` when nothing matches.
+
+`--doctor` reports Python, ripgrep, the console encoding, the presets file, `chromadb`
+and, on Windows, whether the `py` launcher can start Python.
+
+Presets load from `presets.json`: `%APPDATA%\pfind\` on Windows, `~/.config/pfind/`
+elsewhere. Tests: `python -m pytest tests` runs every behaviour on both engines.
+Release notes: [`Changelogs/`](Changelogs/).
+
+---
+
 ## Table of contents
 
 1. [The 30-second version](#1-the-30-second-version)
