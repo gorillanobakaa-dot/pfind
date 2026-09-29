@@ -21,8 +21,10 @@
 # every improvement can flow back and the tool keeps growing. Improvements welcome
 # upstream: https://github.com/gorillanobakaa-dot/pfind
 #
-# VERSION: 2.2.0 | UPDATED: 2026-09-29 | STATUS: live
+# VERSION: 2.2.1 | UPDATED: 2026-09-29 | STATUS: live
 # CHANGELOG:
+#   2.2.1 (2026-09-29) — Importing pfind reads no files: presets load in main(), the brain
+#       store path is a function. Lets agents and harnesses load it without side effects.
 #   2.2.0 (2026-09-29) — Windows port (same file runs on Windows and Linux). (1) Output
 #       from ripgrep is decoded as UTF-8: a file holding an emoji crashed the search on a
 #       Windows code page. stdout/stderr never crash on a legacy console; ANSI colour is
@@ -149,10 +151,15 @@ def _load_presets():
             PRESET_ROOTS[name] = Path(os.path.expandvars(raw)).expanduser()
 
 
-_load_presets()
-BRAIN_CHROMA = Path(os.environ.get("PFIND_BRAIN_DB") or
-                    PRESET_ROOTS["brain"] / "Chroma.DB.and.Brain.xml" / "chroma_db")
+def brain_chroma():
+    """The Chroma store behind --brain: PFIND_BRAIN_DB, or inside the brain preset."""
+    return Path(os.environ.get("PFIND_BRAIN_DB") or
+                PRESET_ROOTS["brain"] / "Chroma.DB.and.Brain.xml" / "chroma_db")
+
+
 BRAIN_DEFAULT_COLLECTION = "core_memory"  # 91k docs; the firefox/IT working memory
+# Presets are loaded in main(), not on import: importing pfind reads no files, so an
+# agent (or `fieldkit tools check`) can load it without side effects.
 
 # Noise this tree is full of. Passed to ripgrep as !globs and used by the fallback.
 EXCLUDE_GLOBS = [
@@ -495,11 +502,11 @@ def semantic_brain(query, collection, top_k):
         print("pfind: --brain semantic needs chromadb (import failed); using lexical only.",
               file=sys.stderr)
         return []
-    if not BRAIN_CHROMA.exists():
-        print(f"pfind: brain store not found at {BRAIN_CHROMA}; lexical only.", file=sys.stderr)
+    if not brain_chroma().exists():
+        print(f"pfind: brain store not found at {brain_chroma()}; lexical only.", file=sys.stderr)
         return []
     try:
-        client = chromadb.PersistentClient(path=str(BRAIN_CHROMA))
+        client = chromadb.PersistentClient(path=str(brain_chroma()))
         col = client.get_collection(collection)
         res = col.query(query_texts=[query], n_results=top_k)
         docs = (res.get("documents") or [[]])[0]
@@ -767,6 +774,7 @@ def build_parser():
 
 
 def main():
+    _load_presets()
     parser = build_parser()
     args = parser.parse_args()
     use_color = setup_console() and not args.no_color and not args.json

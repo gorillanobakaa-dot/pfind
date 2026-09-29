@@ -166,3 +166,27 @@ def test_gitignored_build_output_is_skipped_with_ripgrep(tmp_path):
     (tmp_path / "src.py").write_text("needle_abc = 2\n")
     _, out, _ = run("needle_abc", ".", cwd=tmp_path, engine="ripgrep")
     assert found(out, "src.py") and "out.py" not in out
+
+
+def test_presets_file_is_honoured(tmp_path):
+    """2.2.1 loads presets in main() instead of on import; --work must still use the file."""
+    work = tmp_path / "mywork"
+    work.mkdir()
+    (work / "notes.txt").write_text("needle_preset\n")
+    cfg = tmp_path / "cfg"
+    (cfg / "pfind").mkdir(parents=True)
+    (cfg / "pfind" / "presets.json").write_text(json.dumps({"work": str(work)}))
+    env = {"APPDATA": str(cfg), "XDG_CONFIG_HOME": str(cfg)}
+    rc, out, _ = run("needle_preset", "--work", cwd=tmp_path, env_extra=env)
+    assert rc == 0 and found(out, "mywork/notes.txt")
+
+
+def test_importing_pfind_reads_no_files(monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("pfind_mod", PFIND)
+    mod = importlib.util.module_from_spec(spec)
+    opened = []
+    real = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: opened.append(self) or real(self, *a, **k))
+    spec.loader.exec_module(mod)
+    assert opened == []
