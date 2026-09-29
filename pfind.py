@@ -21,8 +21,21 @@
 # every improvement can flow back and the tool keeps growing. Improvements welcome
 # upstream: https://github.com/gorillanobakaa-dot/pfind
 #
-# VERSION: 2.1.0 | UPDATED: 2026-07-22 | STATUS: live
+# VERSION: 2.2.0 | UPDATED: 2026-09-29 | STATUS: live
 # CHANGELOG:
+#   2.2.0 (2026-09-29) — Windows port (same file runs on Windows and Linux). (1) Output
+#       from ripgrep is decoded as UTF-8: a file holding an emoji crashed the search on a
+#       Windows code page. stdout/stderr never crash on a legacy console; ANSI colour is
+#       switched on through the console API or left off. (2) CRLF: a pasted multi-line
+#       snippet matches files with Windows line endings (\n in the snippet = \r?\n).
+#       (3) The no-ripgrep fallback now equals the rg engine: file-name excludes, hidden
+#       folders skipped unless --hidden, binaries skipped, smart-case, multi-line
+#       snippets, coverage ranking. (4) "build"/"dist" no longer excluded (they hid real
+#       source). (5) Name matching scores the path INSIDE the search root, not C:\Users\..
+#       (6) Presets from a config file (~/.config/pfind/presets.json or
+#       %APPDATA%\pfind\presets.json); CPU count detected. (7) --query-file FILE / "-"
+#       (stdin) for snippets a shell cannot quote; --json for agents; PFIND_NO_RG=1 forces
+#       the fallback; pfind.cmd launcher.
 #   2.1.0 (2026-07-22) — Needle-in-a-haystack-of-needles upgrade. (1) EXACT MULTI-LINE
 #       snippet search: paste a remembered code block (newlines and all) and pfind finds
 #       it literally via `rg -U -F`; --loose tolerates whitespace/indent drift. Designed
@@ -72,19 +85,29 @@ Quick start:
     pfind orchestr --fuzzy              # typo/partial-tolerant name match
     pfind "how do we fix the black window" --brain   # semantic over the Second Brain
 
-Presets (architecture roots):
+Presets (architecture roots; defaults below, override in presets.json):
     --brain  -> ~/Documents/SECOND.BRAIN          (also enables semantic seam)
     --work   -> ~/Documents/FIREFOX.WORK          (the toolkit + patches)
     --src    -> ~/firefox-main                     (the Firefox source tree)
     --all    -> brain + work + src
+    presets.json lives in ~/.config/pfind/ (Linux/macOS) or %APPDATA%\\pfind\\ (Windows):
+        {"brain": "D:/notes", "work": "~/Documents/work", "src": "~/src/firefox"}
+
+Windows:
+    Works the same. Install ripgrep for full speed (winget install BurntSushi.ripgrep.MSVC,
+    or scoop install ripgrep); without it pfind uses its built-in Python engine.
+    Multi-line snippets are hard to type in cmd.exe: save the snippet to a file and run
+    pfind --query-file snippet.txt -x   (or pipe it:  type snippet.txt | pfind - -x)
 
 Output: files ranked best-first. Each line shows the RRF score, WHY it ranked
 (name-match / N content hits / semantic), and the path; content samples follow.
 """
 
 import argparse
+import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -95,8 +118,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Machine / architecture constants
 # ---------------------------------------------------------------------------
-MACHINE = "gorilla-sve14a3aj"
-LOGICAL_CPUS = 8
+IS_WINDOWS = os.name == "nt"
+LOGICAL_CPUS = os.cpu_count() or 4
 
 HOME = Path.home()
 PRESET_ROOTS = {
@@ -104,7 +127,31 @@ PRESET_ROOTS = {
     "work":  HOME / "Documents" / "FIREFOX.WORK",
     "src":   HOME / "firefox-main",
 }
-BRAIN_CHROMA = HOME / "Documents" / "SECOND.BRAIN" / "Chroma.DB.and.Brain.xml" / "chroma_db"
+
+
+def _preset_file():
+    base = os.environ.get("APPDATA") if IS_WINDOWS else os.environ.get("XDG_CONFIG_HOME")
+    return Path(base or (HOME / ".config")) / "pfind" / "presets.json"
+
+
+def _load_presets():
+    """presets.json overrides the default roots: {"brain": "path", ...}."""
+    f = _preset_file()
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        print(f"pfind: ignoring {f}: {e}", file=sys.stderr)
+        return
+    for name, raw in data.items():
+        if name in PRESET_ROOTS and isinstance(raw, str):
+            PRESET_ROOTS[name] = Path(os.path.expandvars(raw)).expanduser()
+
+
+_load_presets()
+BRAIN_CHROMA = Path(os.environ.get("PFIND_BRAIN_DB") or
+                    PRESET_ROOTS["brain"] / "Chroma.DB.and.Brain.xml" / "chroma_db")
 BRAIN_DEFAULT_COLLECTION = "core_memory"  # 91k docs; the firefox/IT working memory
 
 # Noise this tree is full of. Passed to ripgrep as !globs and used by the fallback.
@@ -169,7 +216,13 @@ def rg_common_globs(ext_filter, extra_excludes, include_hidden, no_ignore):
 # ---------------------------------------------------------------------------
 # Engine: ripgrep (preferred) ------------------------------------------------
 # ---------------------------------------------------------------------------
-HAVE_RG = shutil.which("rg") is not None
+HAVE_RG = shutil.which("rg") is not None and not os.environ.get("PFIND_NO_RG")
+
+
+def _rg_run(cmd, timeout):
+    """ripgrep speaks UTF-8; never let the Windows code page decode it (an emoji crashed it)."""
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=timeout)
 
 
 def rg_list_files(roots, ext_filter, extra_excludes, include_hidden, no_ignore, workers):
@@ -182,7 +235,7 @@ def rg_list_files(roots, ext_filter, extra_excludes, include_hidden, no_ignore, 
     cmd += rg_common_globs(ext_filter, extra_excludes, include_hidden, no_ignore)
     cmd += [str(r) for r in roots]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        out = _rg_run(cmd, 120)
     except (subprocess.TimeoutExpired, OSError) as e:
         print(f"pfind: rg --files failed ({e}); continuing without name search", file=sys.stderr)
         return []
@@ -218,7 +271,7 @@ def rg_content(pattern, roots, regex, ignore_case, ext_filter, extra_excludes,
     cmd += [str(r) for r in roots]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = _rg_run(cmd, timeout)
     except (subprocess.TimeoutExpired, OSError) as e:
         print(f"pfind: rg content search failed: {e}", file=sys.stderr)
         return {}
@@ -243,78 +296,133 @@ def rg_content(pattern, roots, regex, ignore_case, ext_filter, extra_excludes,
             if mt:
                 rec["terms"].add(mt.lower()[:40])
         if len(rec["samples"]) < max_per_file:
-            text = (d["lines"].get("text") or "").rstrip("\n")
-            if "\n" in text:  # multi-line match block: fold for one-line display
-                text = " ↵ ".join(s.strip() for s in text.split("\n") if s.strip())
-            if len(text) > 220:
-                text = text[:220] + "…"
-            rec["samples"].append((d.get("line_number", 0), text.strip()))
+            rec["samples"].append((d.get("line_number", 0), _sample(d["lines"].get("text") or "")))
     return dict(hits)
+
+
+def _sample(text):
+    """One display line: CRLF-safe, multi-line blocks folded, long lines cut."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if "\n" in text:  # multi-line match block: fold for one-line display
+        text = " ↵ ".join(s.strip() for s in text.split("\n") if s.strip())
+    text = text.strip()
+    return text[:220] + "…" if len(text) > 220 else text
 
 
 # ---------------------------------------------------------------------------
 # Engine: pure-Python fallback (only if rg is missing) -----------------------
 # ---------------------------------------------------------------------------
-def py_fallback_files(roots, ext_filter, extra_excludes):
-    excl_names = {g for g in EXCLUDE_GLOBS if "*" not in g} | set(extra_excludes)
-    excl_prefix = tuple(g[:-1] for g in EXCLUDE_GLOBS if g.endswith("*"))
+def _norm_exts(ext_filter):
+    return {(e if e.startswith(".") else "." + e).lower() for e in (ext_filter or [])}
+
+
+def _excluded(name, patterns):
+    return any(fnmatch.fnmatch(name, g) for g in patterns)
+
+
+def py_fallback_files(roots, ext_filter, extra_excludes, include_hidden=False):
+    """os.walk engine, applying the same rules as the rg globs: every EXCLUDE_GLOBS
+    pattern to folder AND file names, hidden entries skipped unless asked, --ext with or
+    without its dot. (.gitignore is ripgrep's job; install rg to honour it.)"""
+    patterns = list(EXCLUDE_GLOBS) + list(extra_excludes)
+    exts = _norm_exts(ext_filter)
     files = []
     for root in roots:
+        if Path(root).is_file():
+            files.append(str(root))
+            continue
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames
-                           if d not in excl_names and not d.startswith(excl_prefix)]
+                           if not _excluded(d, patterns) and (include_hidden or not d.startswith("."))]
             for fn in filenames:
-                if ext_filter and Path(fn).suffix not in ext_filter:
+                if _excluded(fn, patterns) or (not include_hidden and fn.startswith(".")):
+                    continue
+                if exts and Path(fn).suffix.lower() not in exts:
                     continue
                 files.append(os.path.join(dirpath, fn))
     return files
 
 
-def py_fallback_content(pattern, files, regex, ignore_case, max_per_file):
-    import re
-    flags = re.IGNORECASE if ignore_case else 0
-    if regex:
-        matcher = re.compile(pattern, flags).search
-    else:
-        needle = pattern.lower() if ignore_case else pattern
-        matcher = (lambda s: needle in s.lower()) if ignore_case else (lambda s: pattern in s)
+def _is_binary(fp):
+    try:
+        with open(fp, "rb") as f:
+            return b"\0" in f.read(8192)
+    except OSError:
+        return True
+
+
+def py_fallback_content(pattern, files, regex, ignore_case, max_per_file, multiline=False):
+    """Pure-Python content search. Same semantics as the rg path: literal unless regex,
+    smart-case (insensitive unless the query has a capital, or -i), binaries skipped,
+    distinct matched terms recorded for coverage ranking, multi-line patterns matched
+    against the whole file."""
+    insensitive = ignore_case or pattern == pattern.lower()
+    flags = (re.IGNORECASE if insensitive else 0) | (re.DOTALL if multiline else 0)
+    rx = re.compile(pattern if regex else re.escape(pattern), flags)
     hits = {}
     for fp in files:
-        try:
-            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                samples, count = [], 0
-                for i, line in enumerate(f, 1):
-                    if matcher(line):
-                        count += 1
-                        if len(samples) < max_per_file:
-                            s = line.strip()
-                            samples.append((i, s[:200] + "…" if len(s) > 200 else s))
-                if count:
-                    hits[fp] = {"count": count, "samples": samples}
-        except (OSError, UnicodeError):
+        if _is_binary(fp):
             continue
+        try:
+            with open(fp, "r", encoding="utf-8", errors="replace", newline="") as f:
+                text = f.read()
+        except OSError:
+            continue
+        samples, count, terms = [], 0, set()
+        if multiline:
+            for m in rx.finditer(text):
+                count += 1
+                terms.add(m.group(0).lower()[:40])
+                if len(samples) < max_per_file:
+                    lineno = text.count("\n", 0, m.start()) + 1
+                    start = text.rfind("\n", 0, m.start()) + 1
+                    end = text.find("\n", m.end())
+                    samples.append((lineno, _sample(text[start:end if end != -1 else len(text)])))
+        else:
+            for i, line in enumerate(text.splitlines(), 1):
+                found = rx.findall(line)
+                if found:
+                    count += 1
+                    terms.update(str(t).lower()[:40] for t in found if t)
+                    if len(samples) < max_per_file:
+                        samples.append((i, _sample(line)))
+        if count:
+            hits[fp] = {"count": count, "samples": samples, "terms": terms}
     return hits
 
 
 # ---------------------------------------------------------------------------
 # Name matching --------------------------------------------------------------
 # ---------------------------------------------------------------------------
-def match_names(query, files, regex, ignore_case, fuzzy):
-    """Rank files by how well the query matches their name/path. Returns [(path, score)]."""
-    import re
+def _inside(fp, roots):
+    """The part of a path below its search root: 'C:\\Users\\me\\Documents' must not
+    make every file match a search for 'documents'."""
+    for r in roots or ():
+        try:
+            return str(Path(fp).relative_to(r))
+        except ValueError:
+            continue
+    return fp
+
+
+def match_names(query, files, regex, ignore_case, fuzzy, roots=None):
+    """Rank files by how well the query matches their name/path. Returns [(path, score)].
+    Smart-case like the content search: a lowercase query ignores case."""
     scored = []
+    insensitive = ignore_case or fuzzy or query == query.lower()
     if regex:
-        rx = re.compile(query, re.IGNORECASE if ignore_case else 0)
-    q = query.lower() if (ignore_case or fuzzy) else query
+        rx = re.compile(query, re.IGNORECASE if insensitive else 0)
+    q = query.lower() if insensitive else query
     for fp in files:
         base = os.path.basename(fp)
-        b = base.lower() if (ignore_case or fuzzy) else base
-        p = fp.lower() if (ignore_case or fuzzy) else fp
+        rel = _inside(fp, roots)
+        b = base.lower() if insensitive else base
+        p = rel.lower() if insensitive else rel
         score = 0.0
         if regex:
             if rx.search(base):
                 score = 3.0
-            elif rx.search(fp):
+            elif rx.search(rel):
                 score = 1.5
         else:
             if q == b or q + Path(base).suffix.lower() == b:
@@ -422,6 +530,42 @@ def c(code, s, use_color):
     return f"\033[{code}m{s}\033[0m" if use_color else s
 
 
+def setup_console():
+    """Never crash on a legacy Windows console, and only colour where colour works.
+    Returns True if ANSI colour can be used on stdout."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    if not sys.stdout.isatty():
+        return False
+    if not IS_WINDOWS:
+        return True
+    try:  # switch on VT processing (Windows 10+); if refused, no colour
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if not k.GetConsoleMode(h, ctypes.byref(mode)):
+            return False
+        return bool(k.SetConsoleMode(h, mode.value | 0x0004))
+    except (OSError, AttributeError):
+        return False
+
+
+def render_json(fused, content_hits, limit):
+    """Machine-readable results for agents: one object, ranked, no colour, no prose."""
+    out = []
+    for path, score, labels in fused[: limit or None]:
+        h = content_hits.get(path, {})
+        out.append({"path": path, "score": round(score, 5), "why": labels,
+                    "hits": h.get("count", 0),
+                    "samples": [{"line": n, "text": t} for n, t in h.get("samples", [])]})
+    print(json.dumps({"engine": "ripgrep" if HAVE_RG else "python", "matched": len(fused),
+                      "results": out}, ensure_ascii=False, indent=1))
+
+
 def render(fused, name_scores, content_hits, args, use_color):
     if not fused:
         print("no matches.", file=sys.stderr)
@@ -465,21 +609,128 @@ def build_loose_regex(snippet):
     match survives reindentation / tabs-vs-spaces / reflowed blank lines. This is the
     'I only half-remember how it was formatted' path.
     """
-    import re
     parts = [re.escape(tok) for tok in snippet.split()]
     return r"\s+".join(p for p in parts if p)
+
+
+def build_exact_regex(snippet):
+    """An exact multi-line snippet that also matches Windows (CRLF) files: literal text,
+    with every line break in the snippet allowed to be \\n or \\r\\n in the file."""
+    lines = snippet.replace("\r\n", "\n").split("\n")
+    return r"\r?\n".join(re.escape(line) for line in lines)
 
 
 # ---------------------------------------------------------------------------
 # Main -----------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Doctor: what this computer has, what pfind needs, how to get it ------------
+# ---------------------------------------------------------------------------
+def _version(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+        return (r.stdout or r.stderr).strip().splitlines()[0] if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        return None
+
+
+def rg_install_options():
+    """Install commands for ripgrep that will work on THIS machine, best first."""
+    opts = []
+    if IS_WINDOWS:
+        if shutil.which("winget"):
+            opts.append(["winget", "install", "-e", "--id", "BurntSushi.ripgrep.MSVC",
+                         "--accept-package-agreements", "--accept-source-agreements"])
+        if shutil.which("scoop"):
+            opts.append(["scoop", "install", "ripgrep"])
+        if shutil.which("choco"):
+            opts.append(["choco", "install", "ripgrep", "-y"])
+    else:
+        for tool, cmd in (("apt-get", ["sudo", "apt-get", "install", "-y", "ripgrep"]),
+                          ("dnf", ["sudo", "dnf", "install", "-y", "ripgrep"]),
+                          ("pacman", ["sudo", "pacman", "-S", "--noconfirm", "ripgrep"]),
+                          ("zypper", ["sudo", "zypper", "install", "-y", "ripgrep"]),
+                          ("brew", ["brew", "install", "ripgrep"])):
+            if shutil.which(tool):
+                opts.append(cmd)
+    return opts
+
+
+def doctor(as_json=False, ask=True):
+    """Scan the computer, say plainly what is there and what is missing, and OFFER to
+    install ripgrep. Nothing is installed without the person typing 'y'."""
+    rg = shutil.which("rg")
+    checks = [
+        ("Python", True, f"{sys.version.split()[0]} at {sys.executable}", ""),
+        ("ripgrep (rg)", bool(rg), (_version(["rg", "--version"]) or "found") + f" at {rg}" if rg else "not installed",
+         "" if rg else "pfind works without it, but slowly and without .gitignore rules."),
+        ("Console text", True, f"stdout encoding {sys.stdout.encoding}",
+         "pfind switches its own output to UTF-8, so any file content is safe to print."),
+        ("Presets file", _preset_file().is_file(), str(_preset_file()),
+         "" if _preset_file().is_file() else "optional: map --brain/--work/--src to your own folders."),
+    ]
+    if IS_WINDOWS and shutil.which("py"):
+        broken = _version(["py", "-3", "-c", "print('ok')"]) != "ok"
+        checks.append(("py launcher", not broken, "works" if not broken else "installed but cannot start Python",
+                       "" if not broken else "it points at a Python that was removed (often an old user account). "
+                                             "pfind.cmd falls back to 'python'; to repair: reinstall Python."))
+    import importlib.util
+    if importlib.util.find_spec("chromadb"):
+        checks.append(("Semantic search (--brain)", True, "chromadb installed", ""))
+    else:
+        checks.append(("Semantic search (--brain)", False, "chromadb not installed",
+                       "optional: only for --brain. pip install chromadb"))
+    options = [] if rg else rg_install_options()
+    if as_json:
+        print(json.dumps({"checks": [{"name": n, "ok": ok, "detail": d, "advice": a} for n, ok, d, a in checks],
+                          "install_ripgrep": [" ".join(o) for o in options]}, indent=1))
+        return 0
+    print(f"pfind doctor - {'Windows' if IS_WINDOWS else sys.platform}\n")
+    for name, ok, detail, advice in checks:
+        print(f"  [{'ok' if ok else '--'}] {name:<26} {detail}")
+        if advice:
+            print(f"       {advice}")
+    if rg:
+        print("\nEverything pfind needs is here.")
+        return 0
+    print("\nTo install ripgrep:")
+    if not options:
+        print("  No package manager found. Download rg from https://github.com/BurntSushi/ripgrep/releases,"
+              "\n  unzip it, and put rg" + (".exe" if IS_WINDOWS else "") + " in a folder on your PATH.")
+        return 0
+    for i, o in enumerate(options, 1):
+        print(f"  {i}. {' '.join(o)}")
+    if not (ask and sys.stdin.isatty()):
+        print("\nRun one of the commands above, then run pfind --doctor again.")
+        return 0
+    try:
+        answer = input(f"\nInstall ripgrep now with option 1 ({options[0][0]})? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):   # no keyboard after all (Git Bash reports a tty): that is a no
+        answer = ""
+        print()
+    if answer != "y":
+        print("Nothing installed.")
+        return 0
+    r = subprocess.run(options[0])
+    ok = r.returncode == 0 and (shutil.which("rg") or _version(["rg", "--version"]))
+    print("ripgrep installed. Open a new terminal so PATH picks it up." if ok
+          else f"The installer exited with {r.returncode}; try another option above.")
+    return 0 if ok else 1
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="pfind",
-        description=f"Hybrid ranked search (name+content+fuzzy, RRF-fused) — tuned for {MACHINE}.",
+        description="Hybrid ranked search (name+content+fuzzy, RRF-fused). Windows and Linux.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="presets: --brain --work --src --all   (see file header for examples)")
-    p.add_argument("query", help="what to find (literal substring by default; regex with -r)")
+        epilog="presets: --brain --work --src --all   (see file header for examples)\n"
+               "first time here? run:  pfind --doctor")
+    p.add_argument("query", nargs="?", help="what to find (literal substring by default; regex with -r); "
+                                            "'-' reads it from stdin")
+    p.add_argument("--query-file", metavar="FILE", help="read the query (e.g. a multi-line snippet) from FILE")
+    p.add_argument("--doctor", action="store_true",
+                   help="check this computer, say what is missing, offer to install ripgrep")
+    p.add_argument("--json", action="store_true", help="machine-readable results (for agents)")
     p.add_argument("paths", nargs="*", help="roots to search (default: cwd, or a preset)")
     # presets
     p.add_argument("--brain", action="store_true", help="search ~/Documents/SECOND.BRAIN + enable semantic seam")
@@ -516,8 +767,21 @@ def build_parser():
 
 
 def main():
-    args = build_parser().parse_args()
-    use_color = sys.stdout.isatty() and not args.no_color
+    parser = build_parser()
+    args = parser.parse_args()
+    use_color = setup_console() and not args.no_color and not args.json
+
+    if args.doctor:
+        return doctor(as_json=args.json)
+    if args.query_file:
+        args.query = Path(args.query_file).read_text(encoding="utf-8", errors="replace")
+    elif args.query == "-":
+        args.query = sys.stdin.read()
+    if args.query is None:
+        parser.error("a query is needed (or --query-file FILE, or '-' for stdin, or --doctor)")
+    args.query = args.query.replace("\r\n", "\n")
+    if args.query.endswith("\n") and args.query.count("\n") > 1:
+        args.query = args.query.rstrip("\n")          # a pasted file ends with a newline
 
     presets = [name for name in ("brain", "work", "src") if getattr(args, name)]
     if args.all:
@@ -533,8 +797,9 @@ def main():
     # resolve the content pattern + engine flags for this mode
     if args.loose:
         pattern, use_regex, use_fixed, multiline = build_loose_regex(args.query), True, False, True
-    elif snippet_mode:                     # --exact or a multi-line paste → literal, spanning newlines
-        pattern, use_regex, use_fixed, multiline = args.query, False, True, True
+    elif snippet_mode:                     # --exact or a multi-line paste → literal, spanning newlines,
+        # as a regex so each line break matches both \n and \r\n (Windows files)
+        pattern, use_regex, use_fixed, multiline = build_exact_regex(args.query), True, False, True
     else:
         pattern, use_regex, use_fixed, multiline = args.query, args.regex, not args.regex, False
 
@@ -542,8 +807,8 @@ def main():
     name_ranked, name_scores = [], {}
     if do_names:
         files = (rg_list_files(roots, args.ext, args.exclude, args.hidden, args.no_ignore, args.workers)
-                 if HAVE_RG else py_fallback_files(roots, set(args.ext or []), args.exclude))
-        scored = match_names(args.query, files, args.regex, args.ignore_case, args.fuzzy)
+                 if HAVE_RG else py_fallback_files(roots, args.ext, args.exclude, args.hidden))
+        scored = match_names(args.query, files, args.regex, args.ignore_case, args.fuzzy, roots)
         name_ranked = [fp for fp, _ in scored]
         name_scores = dict(scored)
 
@@ -556,8 +821,9 @@ def main():
                                       args.workers, args.max,
                                       fixed=use_fixed, multiline=multiline, timeout=args.timeout)
         else:
-            files = py_fallback_files(roots, set(args.ext or []), args.exclude)
-            content_hits = py_fallback_content(pattern, files, use_regex, args.ignore_case, args.max)
+            files = py_fallback_files(roots, args.ext, args.exclude, args.hidden)
+            content_hits = py_fallback_content(pattern, files, use_regex, args.ignore_case, args.max,
+                                               multiline=multiline)
     # RANK BY COVERAGE, not volume: files that match the most DISTINCT query-terms rank
     # first (a config matching regdom+channel14+unlock beats a source file that says
     # 'all channels' 200x). Raw hit-count is only the tiebreak.
@@ -586,14 +852,20 @@ def main():
         rankings["semantic"] = semantic_ranked
 
     if not rankings and not brain_recall:
-        print("no matches.", file=sys.stderr)
+        if args.json:
+            render_json([], {}, 0)
+        else:
+            print("no matches.", file=sys.stderr)
         return 1
 
-    if not HAVE_RG:
-        print("pfind: ripgrep not found — using slower pure-Python fallback. "
-              "Install rg for full speed.", file=sys.stderr)
+    if not HAVE_RG and not args.json:
+        print("pfind: ripgrep not found - using the slower built-in engine. "
+              "Run  pfind --doctor  to install it.", file=sys.stderr)
 
     fused = rrf_fuse(rankings, args.rrf_k) if rankings else []
+    if args.json:
+        render_json(fused, content_hits, args.limit)
+        return 0
     render(fused, name_scores, content_hits, args, use_color)
 
     # pathless brain memory chunks: shown separately, they aren't files

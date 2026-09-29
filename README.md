@@ -97,8 +97,8 @@ short ranked list instead of 400 raw matches.
 
 | Thing | Why | Notes |
 |---|---|---|
-| **Python 3** | pfind is a Python script | 3.8+; tested on 3.13. Standard library only for the core. |
-| **ripgrep** (`rg`) | the actual search engine | Strongly recommended. Without it, pfind falls back to a slower pure-Python search. [Install guide](https://github.com/BurntSushi/ripgrep#installation). |
+| **Python 3** | pfind is a Python script | 3.8+; tested on 3.12 (Windows 11) and 3.13 (Debian). Standard library only for the core. |
+| **ripgrep** (`rg`) | the fast search engine | Strongly recommended. Without it, pfind uses its built-in Python engine: same results, slower, and no `.gitignore` rules. `pfind --doctor` finds the right install command for your machine and offers to run it. |
 | **chromadb** *(optional)* | only for `--brain` semantic search | `pip install chromadb`. Skip it if you don't use semantic search. |
 
 **Get it:**
@@ -109,6 +109,35 @@ python3 pfind.py --help
 ```
 
 That's it — there's nothing to build.
+
+**Not sure what your computer has?** Run the doctor. It checks Python, ripgrep, the console
+and the optional parts, says in plain words what is missing, and offers to install ripgrep
+with your package manager (winget, scoop, Chocolatey, apt, dnf, pacman, zypper or brew). It
+installs nothing unless you type `y`.
+```
+python pfind.py --doctor
+```
+
+### On Windows
+
+The same `pfind.py` runs on Windows 10/11: in PowerShell, cmd or Windows Terminal. It has been
+tested there with and without ripgrep.
+```
+git clone https://github.com/gorillanobakaa-dot/pfind.git
+cd pfind
+py pfind.py --doctor
+```
+To type just `pfind` from any folder, put the pfind folder on your PATH: `pfind.cmd` in it
+starts pfind with the right Python. (Settings → System → About → Advanced system settings →
+Environment Variables → Path → New → the pfind folder.)
+
+Windows details pfind takes care of:
+- **Line endings.** A snippet you paste matches files saved with Windows (CRLF) line endings.
+- **Any text.** Files containing emoji or any other language print safely, even on the old
+  console.
+- **Long snippets.** `cmd.exe` cannot take a multi-line argument, so save the snippet to a
+  file and run `pfind --query-file snippet.txt -x`, or pipe it in: `type snippet.txt | pfind - -x`.
+- **Colour.** Colour is switched on only when the console supports it.
 
 ---
 
@@ -359,11 +388,19 @@ machine](#13-adapting-pfind-to-your-machine).**
 | `--files-only` | | print paths only (script-friendly) |
 | `--count` | | print a match-count summary |
 | `--no-color` | | disable coloured output |
+| `--json` | | machine-readable results for agents: `{engine, matched, results: [{path, score, why, hits, samples}]}` |
+| `--query-file FILE` / `-` | | read the query from a file, or from stdin (`-`), for snippets a shell cannot quote |
+| `--doctor` | | check this computer, say what is missing, offer to install ripgrep |
 
-**Always-on noise excludes:** version-control dirs, `node_modules`, `__pycache__`, build/object
-dirs (`obj-*`, `dist`, `build`, `.mozbuild`), Python/virtualenv caches, vector-store binaries
-(`chroma_db`, `*.sqlite3`, `*.bin`, `*.parquet`), and minified assets. ripgrep also honours
-`.gitignore` unless you pass `--no-ignore`.
+**Always-on noise excludes:** version-control dirs, `node_modules`, `__pycache__`, object dirs
+(`obj-*`, `.mozbuild`), Python/virtualenv caches, vector-store binaries (`chroma_db`,
+`*.sqlite3`, `*.bin`, `*.parquet`), and minified assets. Hidden files and binary files are
+skipped unless you pass `--hidden`. ripgrep also honours `.gitignore` unless you pass
+`--no-ignore`.
+
+Folders named `build` or `dist` are **searched** (since 2.2.0). They often hold real source
+code, and skipping them made pfind report "not found" for code that existed. Build output is
+normally in `.gitignore`; add `--exclude build` to skip it by hand.
 
 **Exit codes:** `0` = ran, `1` = no matches, `130` = interrupted.
 
@@ -422,8 +459,8 @@ separate, deliberate step.**
   whitespace between tokens. If a snippet had its spaces stripped, use `--exact` or shorten the
   query to one distinctive line.
 - Snippet mode is **content-only** — a pasted code block is never treated as a filename.
-- The pure-Python fallback (when `rg` is missing) is correct but slow; don't run it over a huge
-  tree.
+- The built-in Python engine (when `rg` is missing) gives the same results, but it is slow and
+  does not read `.gitignore`. Don't run it over a huge tree; run `pfind --doctor` instead.
 - It builds **no persistent index** — see below for why that's a deliberate choice.
 
 ---
@@ -449,15 +486,19 @@ separate, deliberate step.**
 
 ## 13. Adapting pfind to *your* machine
 
-This copy is tuned for one specific laptop. To make it yours, open `pfind.py` and edit the
-constants near the top:
+No code editing needed:
 
-- **`PRESET_ROOTS`** — the folders behind `--brain` / `--work` / `--src`. Point these at *your*
-  projects (or delete the ones you don't want).
-- **`BRAIN_CHROMA` / `BRAIN_DEFAULT_COLLECTION`** — path to your Chroma database and the default
-  collection name, if you use `--brain`.
-- **`MACHINE` / `LOGICAL_CPUS`** — cosmetic label and the default thread count.
-- **`EXCLUDE_GLOBS`** — the always-skip noise list; add anything specific to your trees.
+- **Presets:** create `presets.json` to point `--brain` / `--work` / `--src` at your folders. It
+  lives in `~/.config/pfind/` on Linux and macOS, and in `%APPDATA%\pfind\` on Windows
+  (`pfind --doctor` prints the exact path):
+  ```json
+  {"brain": "D:/notes", "work": "~/Documents/work", "src": "~/src/firefox"}
+  ```
+- **Brain database:** set the `PFIND_BRAIN_DB` environment variable to your Chroma folder. It
+  defaults to one inside the brain preset.
+- **Threads:** the CPU count is detected; `--workers N` overrides it.
+- **`EXCLUDE_GLOBS`** in `pfind.py` is the always-skip noise list; add anything specific to
+  your trees.
 
 Everything else works out of the box.
 
@@ -475,6 +516,10 @@ Describe a concept, not exact words?                          → translate to l
 Don't know where it lives?                                    → add --all  (or scope to one preset to go faster)
 ```
 
+Use `--json` to get results you can parse: no colour, no prose, a fixed shape. Use
+`--query-file` for a snippet you cannot quote safely. Exit code `1` with `"results": []` means
+nothing was found.
+
 Then **read the top hit before doing anything else** — pfind returns `path:line`, not answers.
 **Hard boundary: pfind LOCATES, it does not EDIT.** "Find X and fix it" ends, for pfind, at the
 file and line; any fix is a separate, deliberate step that reads the file and the project's
@@ -490,8 +535,14 @@ rules first. Never assume something is broken just because you were told so.
 `pfind_v2.py` / `pfind_new.py` / a renamed copy — spawning duplicates instead of editing is the
 exact mess this kind of tool exists to clean up. One canonical file, versioned in place.
 
-Current: **v2.1.0** — hybrid name+content+fuzzy search, RRF fusion, exact/loose multi-line
-snippet search, coverage ranking, and an optional semantic layer over a local vector database.
+Current: **v2.2.0**. It adds the Windows port: CRLF-safe snippets, UTF-8-safe output, a
+built-in engine equal to the ripgrep one, the doctor, `--json`, `--query-file`, and
+configurable presets. Everything from v2.1.0 remains: hybrid name + content + fuzzy search,
+RRF fusion, exact and loose multi-line snippet search, coverage ranking, and an optional
+semantic layer over a local vector database.
+
+Tests: `python -m pytest tests`. Every behaviour is checked on both engines (ripgrep, and the
+built-in one via `PFIND_NO_RG=1`).
 
 ---
 
