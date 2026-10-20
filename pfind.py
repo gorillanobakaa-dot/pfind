@@ -21,8 +21,14 @@
 # every improvement can flow back and the tool keeps growing. Improvements welcome
 # upstream: https://github.com/gorillanobakaa-dot/pfind
 #
-# VERSION: 2.2.1 | UPDATED: 2026-09-29 | STATUS: live
+# VERSION: 2.2.2 | UPDATED: 2026-10-20 | STATUS: live
 # CHANGELOG:
+#   2.2.2 (2026-10-20) — --brain sends nothing and downloads nothing. Chroma is opened
+#       with its usage telemetry replaced by a stand-in that sends nothing (the vendor's
+#       library is never loaded) and with an embedder that refuses to download a model:
+#       a missing model is an error that says where to put it, never a fetch. Ported from
+#       the copy Gorilla OpenCode embeds, where it is tested against a real chromadb behind
+#       a dead proxy.
 #   2.2.1 (2026-09-29) — Importing pfind reads no files: presets load in main(), the brain
 #       store path is a function. Lets agents and harnesses load it without side effects.
 #   2.2.0 (2026-09-29) — Windows port (same file runs on Windows and Linux). (1) Output
@@ -483,6 +489,57 @@ def rrf_fuse(rankings, k, weights=RRF_WEIGHTS):
 # ---------------------------------------------------------------------------
 # Semantic seam (opt-in, --brain) -------------------------------------------
 # ---------------------------------------------------------------------------
+_NO_TELEMETRY_MODULE = "gorilla_pfind_no_telemetry"
+
+
+def _cut_chroma_doors():
+    """Import chromadb with its telemetry and model download cut out (2.2.2).
+
+    Two doors Chroma opens on its own: usage telemetry to the vendor (on by default),
+    and a download of the embedding model on first use. The telemetry client is replaced
+    by a stand-in that sends nothing, so the vendor's telemetry library is never loaded;
+    the embedder refuses to download. Returns (chromadb, Settings kwargs, embedder class)."""
+    import types
+    os.environ["ANONYMIZED_TELEMETRY"] = "False"
+    import chromadb
+    from chromadb.telemetry.product import ProductTelemetryClient
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+
+    def capture(self, event):
+        return None
+
+    def no_user_id(self):  # never creates telemetry_user_id
+        return self.UNKNOWN_USER_ID
+
+    def no_download(self, url, fname, chunk_size=1024):
+        raise RuntimeError("semantic model not on disk and pfind never downloads; "
+                           f"place it at {self.DOWNLOAD_PATH}")
+
+    # Chroma's base classes use the `overrides` metaclass, which rejects a method defined
+    # in a class body here (it cannot see local classes' parents); the methods are
+    # therefore attached after the class exists.
+    class NoTelemetry(ProductTelemetryClient):
+        pass
+    NoTelemetry.capture = capture
+    NoTelemetry.user_id = property(no_user_id)
+    NoTelemetry.__abstractmethods__ = frozenset()
+
+    class LocalModelOnly(ONNXMiniLM_L6_V2):
+        pass
+    LocalModelOnly._download = no_download
+
+    mod = types.ModuleType(_NO_TELEMETRY_MODULE)
+    mod.NoTelemetry = NoTelemetry
+    sys.modules[_NO_TELEMETRY_MODULE] = mod
+    impl = f"{_NO_TELEMETRY_MODULE}.NoTelemetry"
+    settings = {
+        "anonymized_telemetry": False,
+        "chroma_product_telemetry_impl": impl,
+        "chroma_telemetry_impl": impl,
+    }
+    return chromadb, settings, LocalModelOnly
+
+
 def semantic_brain(query, collection, top_k):
     """
     Best-effort semantic query over the Chroma Second Brain. Degrades gracefully:
@@ -497,7 +554,7 @@ def semantic_brain(query, collection, top_k):
     path IF the chunk's metadata carries one (then it can fuse with file results), else None.
     """
     try:
-        import chromadb
+        chromadb, settings, LocalModelOnly = _cut_chroma_doors()
     except ImportError:
         print("pfind: --brain semantic needs chromadb (import failed); using lexical only.",
               file=sys.stderr)
@@ -506,8 +563,9 @@ def semantic_brain(query, collection, top_k):
         print(f"pfind: brain store not found at {brain_chroma()}; lexical only.", file=sys.stderr)
         return []
     try:
-        client = chromadb.PersistentClient(path=str(brain_chroma()))
-        col = client.get_collection(collection)
+        from chromadb.config import Settings
+        client = chromadb.PersistentClient(path=str(brain_chroma()), settings=Settings(**settings))
+        col = client.get_collection(collection, embedding_function=LocalModelOnly())
         res = col.query(query_texts=[query], n_results=top_k)
         docs = (res.get("documents") or [[]])[0]
         metas = (res.get("metadatas") or [[]])[0]
