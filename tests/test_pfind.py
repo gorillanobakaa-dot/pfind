@@ -153,8 +153,29 @@ def test_doctor_reports_and_never_installs_without_a_person(tmp_path):
 
 
 def test_query_required(tmp_path):
-    rc, _, err = run(cwd=tmp_path)
+    """3.x: no query at all is a listing of the folder. A query asked for through a file or
+    stdin that turns out empty is an error (2.2 refused the bare call; 3.3 keeps the listing)."""
+    (tmp_path / "listed.txt").write_text("x\n")
+    rc, out, _ = run(cwd=tmp_path)
+    assert rc == 0 and "listed.txt" in out
+    empty = tmp_path / "empty.txt"
+    empty.write_text("")
+    rc, _, err = run("--query-file", str(empty), cwd=tmp_path)
     assert rc == 2 and "query is needed" in err
+    rc, _, err = run("-", cwd=tmp_path, stdin=b"")
+    assert rc == 2 and "query is needed" in err
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_tree_starts_at_the_searched_folder(tree, engine):
+    """3.3: --tree printed the drive, then one line per folder above the search root."""
+    rc, out, _ = run("--tree", cwd=tree / "pkg", engine=engine)
+    lines = out.splitlines()
+    assert rc == 0 and lines[0] == str(tree / "pkg"), out
+    assert any(l.endswith("── build") for l in lines) and any(l.endswith("── kernel.py") for l in lines)
+    assert not any(l.endswith("── " + tree.parts[1]) for l in lines), out   # no chain above the root
+    _, out, _ = run("verify_fragment", ".", "--tree", cwd=tree, engine=engine)
+    assert out.splitlines()[0] == str(tree) and "kernel.py" in out and "test_kernel.py" in out, out
 
 
 @pytest.mark.skipif(not shutil.which("rg"), reason="needs ripgrep")

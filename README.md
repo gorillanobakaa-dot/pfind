@@ -31,7 +31,10 @@ You type a word, part of a file name, or a piece of code you remember, and pfind
 the files that match. The best matches come first, each with the lines that matched, so
 you read a few lines instead of opening hundreds of files.
 
-It works on **Windows and Linux** with the same single file. If you are not sure your
+Run it with no search word and it shows the folder instead: as a tree, as a detailed list
+(sizes, dates, git status), or as a count of lines of code per language.
+
+It works on **Windows and Linux** with the same single file, and on macOS. If you are not sure your
 computer has what it needs, run `pfind --doctor`. It checks your computer, tells you in
 plain words what is missing, and offers to install the one helper that makes it fast
 (`ripgrep`). It installs nothing unless you type `y`. Without that helper pfind still works:
@@ -42,8 +45,11 @@ finds and shows.
 
 ## Technical Definition (Developer Track)
 
-A single Python 3.8+ file, with only the standard library for the core. It runs two search
-engines and requires them to give the same results:
+A single Python 3.7+ file, with only the standard library for the core. Since 3.0 it also
+carries a ripgrep-compatible flag surface (context lines, types, globs, `-o`, `-c`, `-v`,
+archives with `-z`) and eza-style listings (`--tree`, `--long`, `--code`, git badges); `pfind
+--help` lists all 183 options. It runs two search engines and requires them to give the same
+results:
 
 - **ripgrep engine.** `rg --files` and `rg --json`, UTF-8 decoded, honouring `.gitignore`.
 - **Built-in engine.** An `os.walk` search used when ripgrep is missing or when
@@ -63,8 +69,10 @@ samples}]}`, and the exit code is `1` when nothing matches.
 `--doctor` reports Python, ripgrep, the console encoding, the presets file, `chromadb`
 and, on Windows, whether the `py` launcher can start Python.
 
-Presets load from `presets.json`: `%APPDATA%\pfind\` on Windows, `~/.config/pfind/`
-elsewhere. Tests: `python -m pytest tests` runs every behaviour on both engines.
+Presets load from `presets.json` (`%APPDATA%\pfind\` on Windows when the file is there,
+otherwise `$XDG_CONFIG_HOME/pfind/` or `~/.config/pfind/`) or from `PFIND_BRAIN`, `PFIND_WORK`,
+`PFIND_SRC`. Importing `pfind.py` reads no files. Tests: `python -m pytest tests` runs every
+behaviour on both engines.
 Release notes: [`Changelogs/`](Changelogs/).
 
 ---
@@ -141,7 +149,7 @@ short ranked list instead of 400 raw matches.
 
 | Thing | Why | Notes |
 |---|---|---|
-| **Python 3** | pfind is a Python script | 3.8+; tested on 3.12 (Windows 11) and 3.13 (Debian). Standard library only for the core. |
+| **Python 3** | pfind is a Python script | 3.7+; tested on 3.12 (Windows 11) and 3.13 (Debian). Standard library only for the core. |
 | **ripgrep** (`rg`) | the fast search engine | Strongly recommended. Without it, pfind uses its built-in Python engine: same results, slower, and no `.gitignore` rules. `pfind --doctor` finds the right install command for your machine and offers to run it. |
 | **chromadb** *(optional)* | only for `--brain` semantic search | `pip install chromadb`. Skip it if you don't use semantic search. |
 
@@ -337,6 +345,15 @@ rg 'literal string'              # raw content matches to pipe elsewhere
 **Rule of thumb:** *know exactly what you want → simple tool. Half-remember it, or don't know
 where it lives → pfind.*
 
+### Looking around a folder (no search word)
+With no query, pfind lists instead of searching:
+```bash
+pfind --tree                     # the folder as a tree (a huge tree is summarised by folder)
+pfind --long src                 # detailed list: permissions, size, age, git status
+pfind --code                     # lines of code, comments and blanks per language
+pfind --files --ext py           # every file a search would look at, nothing else
+```
+
 ---
 
 ## 6. How to read the results
@@ -446,7 +463,12 @@ Folders named `build` or `dist` are **searched** (since 2.2.0). They often hold 
 code, and skipping them made pfind report "not found" for code that existed. Build output is
 normally in `.gitignore`; add `--exclude build` to skip it by hand.
 
-**Exit codes:** `0` = ran, `1` = no matches, `130` = interrupted.
+This table is the everyday set. `pfind --help` lists all 183 options, including ripgrep's
+(`-C`, `-t`, `-g`, `-o`, `-c`, `-v`, `-z`, `-w`, `-m` …) and eza's listing options (`--tree`,
+`--long`, `--git`, `--icons`, `--sort` …).
+
+**Exit codes:** `0` = ran, `1` = no matches, `2` = error (a crash never looks like "no
+matches"), `130` = interrupted.
 
 ---
 
@@ -514,11 +536,13 @@ separate, deliberate step.**
 - **Engine:** pfind shells out to **ripgrep** — it enumerates files (`rg --files`) and searches
   contents (`rg --json`), then does the ranking/fusion in Python. If `rg` is missing it falls
   back to a pure-Python walker so it never hard-fails.
-- **Exact snippets:** ripgrep's multi-line mode (`-U`) with fixed-string matching (`-F`).
+- **Exact snippets:** ripgrep's multi-line mode (`-U`). The snippet is escaped line by line and
+  the lines are joined with `\r?\n`, so it matches files with Windows or Linux line endings.
   `--loose` compiles your snippet into a whitespace-flexible regex.
 - **Semantic search:** an optional query against a local [Chroma](https://www.trychroma.com/)
-  vector database, using the `all-MiniLM-L6-v2` embedding model. It degrades gracefully — if
-  the DB or model isn't there, pfind just skips semantic and does the rest.
+  vector database, using the `all-MiniLM-L6-v2` embedding model. Chroma is opened with its
+  usage reporting cut out and its model download refused (see Privacy below). It degrades
+  gracefully — if the DB or model isn't there, pfind just skips semantic and does the rest.
 - **No index, by design.** A pre-built search index makes repeat queries instant, but it goes
   stale, needs rebuilding, and is one more thing that can be lost or corrupted. On an SSD, a
   full scan of even a 120 M-line tree is about a minute cold and seconds warm — cheap enough
@@ -538,8 +562,10 @@ No code editing needed:
   ```json
   {"brain": "D:/notes", "work": "~/Documents/work", "src": "~/src/firefox"}
   ```
-- **Brain database:** set the `PFIND_BRAIN_DB` environment variable to your Chroma folder. It
-  defaults to one inside the brain preset.
+- **Brain database:** add `"chroma": "~/notes/chroma_db"` (and optionally `"collection"`) to
+  `presets.json`, or set `PFIND_CHROMA` (`PFIND_BRAIN_DB` also works). There is no default: an
+  unconfigured `--brain` says how to configure it and searches by words only.
+- **Presets without a file:** `PFIND_BRAIN`, `PFIND_WORK` and `PFIND_SRC` override the file.
 - **Threads:** the CPU count is detected; `--workers N` overrides it.
 - **`EXCLUDE_GLOBS`** in `pfind.py` is the always-skip noise list; add anything specific to
   your trees.
@@ -579,11 +605,13 @@ rules first. Never assume something is broken just because you were told so.
 `pfind_v2.py` / `pfind_new.py` / a renamed copy — spawning duplicates instead of editing is the
 exact mess this kind of tool exists to clean up. One canonical file, versioned in place.
 
-Current: **v2.2.0**. It adds the Windows port: CRLF-safe snippets, UTF-8-safe output, a
-built-in engine equal to the ripgrep one, the doctor, `--json`, `--query-file`, and
-configurable presets. Everything from v2.1.0 remains: hybrid name + content + fuzzy search,
-RRF fusion, exact and loose multi-line snippet search, coverage ranking, and an optional
-semantic layer over a local vector database.
+Current: **v3.3.0**. The 2.2 line (the Windows port: CRLF-safe snippets, UTF-8-safe output,
+a built-in engine equal to the ripgrep one, the doctor, `--json`, `--query-file`) and the 3.x
+line (the ripgrep and eza flag surfaces, listings, LOC counting; the engine of Gorilla
+OpenCode's `find` tool) had split. 3.3.0 is both in one file, and the same file ships in this
+repository and inside Gorilla OpenCode. Everything from v2.1.0 remains: hybrid name + content +
+fuzzy search, RRF fusion, exact and loose multi-line snippet search, coverage ranking, and an
+optional semantic layer over a local vector database.
 
 Tests: `python -m pytest tests`. Every behaviour is checked on both engines (ripgrep, and the
 built-in one via `PFIND_NO_RG=1`).
@@ -609,6 +637,9 @@ sharing" loophole, which matters because pfind has a plausible server future (se
 tool servers). If you build pfind into a networked service, honor AGPL §13 — offer your users
 the corresponding source.
 
-*Privacy:* pfind is local by default and sends nothing over the network. The only exception is
-the optional `--brain` semantic model, downloaded once from Hugging Face, after which it runs
-entirely offline.
+*Privacy:* pfind sends nothing over the network and downloads nothing when it searches. With
+`--brain`, Chroma's usage reporting is replaced by a stand-in before Chroma loads (its
+telemetry library is never imported), and Chroma's download of the embedding model is refused:
+the model must already be on the computer. Tested on a real `chromadb` behind a dead proxy
+(`tests/test_brain_doors.py`). The only network use is `pfind --doctor` installing ripgrep
+through your own package manager, and only after you type `y`.
