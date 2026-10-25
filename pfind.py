@@ -83,8 +83,12 @@ import json
 import lzma
 import math
 import os
-import pwd
-import grp
+try:
+    import pwd
+    import grp
+except ImportError:
+    pwd = None
+    grp = None
 import re
 import shlex
 import shutil
@@ -98,6 +102,28 @@ import zipfile
 from collections import defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
+
+# GORILLA OVERRIDE (2026-09-01): force UTF-8 on the output streams.
+#
+# On Windows, Python picks the console's legacy code page for stdout — cp1252 on
+# a UK/US install — and pfind's output is full of characters that page cannot
+# represent: the tree connectors, the box-drawing rules, the arrows in the long
+# view. Printing one of them raises
+#
+#   UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-2
+#
+# which kills the whole search. The caller sees "search FAILED", so the failure
+# is at least honest, but the tree view simply did not work on Windows at all.
+#
+# errors="replace" rather than "strict": a single unrepresentable byte in a
+# matched line must never cost the user the entire result set. Guarded because
+# .reconfigure() is Python 3.7+ and the streams may be replaced by a harness.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if (_stream.encoding or "").lower().replace("-", "") != "utf8":
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 # ---------------------------------------------------------------------------
 # Machine & Preset Resolution — NOTHING machine-specific is hardcoded.
@@ -1212,22 +1238,133 @@ def py_fallback_files(roots, ext_filter, extra_excludes, type_globs, max_depth=N
         files = git_ignored_filter(files)
     return files
 
+# GORILLA OVERRIDE (2026-08-20): a decompression budget for --search-zip.
+#
+# THE HOLE THIS CLOSES. _read_lines() decompressed archive members straight into
+# a list with no cap. The --max-filesize guard does not help: it checks
+# os.lstat(fp).st_size, which is the COMPRESSED size on disk. A 42 KB zip that
+# expands to gigabytes passes any cap you set and then exhausts memory. That is
+# the classic decompression bomb, and on the 2012 laptops this is built for the
+# machine dies rather than degrades.
+#
+# WHY A SHARED BUDGET AND NOT A PER-MEMBER ONE: a per-member cap stops one huge
+# member and does nothing about ten thousand small ones. The budget is spent
+# across the WHOLE archive.
+#
+# WHY IT IS LOUD. Truncating results silently would make "no matches" and "I
+# stopped reading" look identical - the failure this project cares most about.
+# When the budget runs out it says so on stderr, naming the file.
+MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024
+
+
+class _Budget:
+    """Bytes remaining for one archive. take() returns how many may still be read."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.left = limit
+        self.blown = False
+
+    def offer(self, n):
+        """How many bytes may be attempted next. Does NOT charge for them."""
+        if n <= 0 or self.left <= 0:
+            return 0
+        return min(n, self.left)
+
+    def spend(self, n):
+        """Charge for bytes ACTUALLY read.
+
+        Charging on offer instead of on spend was a real bug: a chunk size of
+        1 MB against a 100 KB tar member burned 1 MB of budget for 100 KB of
+        data, so a 64 MB budget truncated a legitimate archive after ~3 MB. Only
+        bytes that arrived are billed.
+        """
+        self.left -= n
+
+
+def _read_capped(handle, budget, chunk=1 << 20):
+    """Read a binary handle in chunks until it ends or the budget is spent."""
+    out = []
+    while True:
+        room = budget.offer(chunk)
+        if room == 0:
+            budget.blown = True
+            break
+        block = handle.read(room)
+        if not block:
+            break
+        budget.spend(len(block))
+        out.append(block)
+    return b"".join(out)
+
+
+def _text_lines_capped(f, budget, chunk=1 << 20):
+    """Same, for an already-decoded text stream."""
+    out = []
+    while True:
+        room = budget.offer(chunk)
+        if room == 0:
+            budget.blown = True
+            break
+        block = f.read(room)
+        if not block:
+            break
+        # Text mode: read() returns CHARACTERS. Bill the encoded length so the
+        # budget stays a byte budget in both paths.
+        budget.spend(len(block.encode("utf-8", "ignore")))
+        out.append(block)
+    return "".join(out).splitlines(keepends=True)
+
+
+def _max_decompressed():
+    """Budget in bytes. PFIND_MAX_DECOMPRESSED_MB overrides it; 0 means no cap,
+    for someone who genuinely knows the archive and has the memory."""
+    raw = os.environ.get("PFIND_MAX_DECOMPRESSED_MB", "").strip()
+    if raw:
+        try:
+            mb = float(raw)
+            if mb <= 0:
+                return float("inf")
+            return int(mb * 1024 * 1024)
+        except ValueError:
+            pass
+    return MAX_DECOMPRESSED_BYTES
+
+
+def _budget_note(fp, budget):
+    # Report the limit ACTUALLY in force, not the module default. The first
+    # version printed MAX_DECOMPRESSED_BYTES while a smaller env override was
+    # active, so the warning named a number the run had never used - a message
+    # that lies about its own cause is worse than no message.
+    if budget.blown:
+        print("pfind: %s exceeded the %d MB decompression budget - results are "
+              "PARTIAL. Raise it with PFIND_MAX_DECOMPRESSED_MB if you meant it."
+              % (fp, budget.limit // (1024 * 1024)), file=sys.stderr)
+
+
 def _read_lines(fp, search_zip, encoding):
     """Read a file as text lines, transparently decompressing when --search-zip
     is on. gz/bz2/xz/lzma stream directly; zip and tar are containers, so their
     members are concatenated in archive order."""
     enc = encoding or "utf-8"
     if search_zip:
+        budget = _Budget(_max_decompressed())
         low = fp.lower()
         if low.endswith((".gz", ".tgz")) and not low.endswith(".tar.gz"):
             with gzip.open(fp, "rt", encoding=enc, errors="ignore") as f:
-                return f.readlines()
+                lines = _text_lines_capped(f, budget)
+            _budget_note(fp, budget)
+            return lines
         if low.endswith(".bz2") and not low.endswith(".tar.bz2"):
             with bz2.open(fp, "rt", encoding=enc, errors="ignore") as f:
-                return f.readlines()
+                lines = _text_lines_capped(f, budget)
+            _budget_note(fp, budget)
+            return lines
         if low.endswith((".xz", ".lzma")) and not low.endswith(".tar.xz"):
             with lzma.open(fp, "rt", encoding=enc, errors="ignore") as f:
-                return f.readlines()
+                lines = _text_lines_capped(f, budget)
+            _budget_note(fp, budget)
+            return lines
         if low.endswith(".zip"):
             lines = []
             with zipfile.ZipFile(fp) as z:
@@ -1235,7 +1372,11 @@ def _read_lines(fp, search_zip, encoding):
                     if name.endswith("/"):
                         continue
                     with z.open(name) as member:
-                        lines.extend(member.read().decode(enc, "ignore").splitlines(keepends=True))
+                        raw = _read_capped(member, budget)
+                    lines.extend(raw.decode(enc, "ignore").splitlines(keepends=True))
+                    if budget.blown:
+                        break
+            _budget_note(fp, budget)
             return lines
         if tarfile.is_tarfile(fp):
             lines = []
@@ -1246,7 +1387,11 @@ def _read_lines(fp, search_zip, encoding):
                     handle = t.extractfile(member)
                     if handle is None:
                         continue
-                    lines.extend(handle.read().decode(enc, "ignore").splitlines(keepends=True))
+                    raw = _read_capped(handle, budget)
+                    lines.extend(raw.decode(enc, "ignore").splitlines(keepends=True))
+                    if budget.blown:
+                        break
+            _budget_note(fp, budget)
             return lines
     with open(fp, "r", encoding=enc, errors="ignore") as f:
         return f.readlines()
@@ -1699,11 +1844,11 @@ def render_long_table(paths, content_hits, git_cache, args, use_color):
                 user_str, group_str = str(st.st_uid), str(st.st_gid)
             else:
                 try:
-                    user_str = pwd.getpwuid(st.st_uid).pw_name
+                    user_str = pwd.getpwuid(st.st_uid).pw_name if pwd else str(st.st_uid)
                 except (KeyError, AttributeError):
                     user_str = str(st.st_uid)
                 try:
-                    group_str = grp.getgrgid(st.st_gid).gr_name
+                    group_str = grp.getgrgid(st.st_gid).gr_name if grp else str(st.st_gid)
                 except (KeyError, AttributeError):
                     group_str = str(st.st_gid)
             # --smart-group: show the group only when it differs from the owner
